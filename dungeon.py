@@ -7,7 +7,7 @@ import re
 
 # Constants
 TILES_HARD_ROCK = '^' # Indestructible
-TILES_SOFT_ROCK = chr(176) # '░' Diggable (Deep rock) - Texture Change (Light Shade)
+TILES_SOFT_ROCK = ' ' # Diggable (Deep rock) - Visual change to Space
 TILES_DIRT_WALL = chr(177) # '▒' Render-only (Exposed Soft Rock) - Medium Shade to differentiate? Or user said "Keep characters"... let's leave it as '░' for now if user explicitly asked for 176 on deep rock.
 # Actually user said "Keep the characters for exposed rock". Exposed rock was '░'. Deep rock was '"'.
 # Now Deep Rock is 176 ('░'). So they are the same. I'll stick to 176 for Deep and '░' for Dirt.
@@ -43,6 +43,7 @@ class Tile:
         self.is_solid = char in [TILES_HARD_ROCK, TILES_SOFT_ROCK, TILES_REINFORCED, TILES_GOLD]
         self.gold_value = 500 if char == TILES_GOLD else 0
         self.gold_stored = 0 # For Treasury
+        self.progress = 0 # For digging/reinforcing steps. Max varying.
 
 class Map:
     def __init__(self, width, height):
@@ -145,7 +146,7 @@ class Map:
                 if path: return path[0]
                 return None
             
-            for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+            for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0), (1, 1), (1, -1), (-1, 1), (-1, -1)]:
                 nx, ny = curr_x + dx, curr_y + dy
                 
                 # Check bounds and walkability
@@ -163,7 +164,16 @@ class Map:
                             queue.append((nx, ny, new_path))
         return None
 
-    def find_nearest_tagged(self, start_x, start_y):
+    def is_exposed(self, x, y):
+        # Check 8 neighbors for non-solid
+        for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0), (1, 1), (1, -1), (-1, 1), (-1, -1)]:
+            nx, ny = x + dx, y + dy
+            if 0 <= nx < self.width and 0 <= ny < self.height:
+                if not self.tiles[ny][nx].is_solid:
+                    return True
+        return False
+
+    def find_nearest_tagged(self, start_x, start_y, exclude=set()):
         # BFS to find nearest tagged tile or Gold
         queue = [(start_x, start_y)]
         visited = set([(start_x, start_y)])
@@ -171,23 +181,16 @@ class Map:
         while queue:
             curr_x, curr_y = queue.pop(0)
             
-            # Check neighbors (8-way)
-            for dx in [-1, 0, 1]:
-                for dy in [-1, 0, 1]:
-                    if dx == 0 and dy == 0: continue
-                    nx, ny = curr_x + dx, curr_y + dy
-                    if 0 <= nx < self.width and 0 <= ny < self.height:
-                         # ... check logic
-                         pass # handled in loop below
-            
             # Actual Loop
             DIRECTIONS = [(0, 1), (0, -1), (1, 0), (-1, 0), (1, 1), (1, -1), (-1, 1), (-1, -1)]
             for dx, dy in DIRECTIONS:
                 nx, ny = curr_x + dx, curr_y + dy
                 if 0 <= nx < self.width and 0 <= ny < self.height:
                     tile = self.tiles[ny][nx]
-                    if tile.tagged and tile.is_solid:
-                        return tile
+                    if tile.tagged and tile.is_solid and (nx, ny) not in exclude:
+                        # MUST be exposed to open air (or accessible)
+                        if self.is_exposed(nx, ny):
+                            return tile
             
                     if not tile.is_solid and (nx, ny) not in visited:
                         visited.add((nx, ny))
@@ -286,7 +289,8 @@ class Map:
                 if 0 <= nx < self.width and 0 <= ny < self.height:
                     tile = self.tiles[ny][nx]
                     # Must be Soft Rock (Dirt Wall), Not Tagged
-                    if tile.char == TILES_SOFT_ROCK and not tile.tagged:
+                    # Must be Soft Rock (Dirt Wall), Not Tagged, AND NOT GOLD
+                    if tile.char == TILES_SOFT_ROCK and not tile.tagged and tile.char != TILES_GOLD:
                          return tile
             
             # Continue
@@ -312,14 +316,40 @@ class EntityManager:
 
     def spawn_imp(self, x, y):
         # Added tick_offset to randomize updates or idle timing
+        names = ["Op", "Baz", "Fo", "Zot", "Taw", "Bip", "Mog", "Gub"]
+        name = random.choice(names)
         self.imps.append({
             'x': x, 'y': y, 
             'state': 'IDLE', 
             'target': None, 
             'idle_timer': 0,
             'gold': 0,
-            'work_timer': 0
+            'work_timer': 0, # Still used for anim/state? Or purely tile progress now?
+            'name': name,
+            'level': 1,
+            'xp': 0
         })
+
+    def get_level_threshold(self, level):
+        # Starting level 1. Level 2 takes 10 xp.
+        # Each level above two takes twice as much as the level before.
+        # L1->L2: 10
+        # L2->L3: 20
+        # L3->L4: 40
+        if level < 1: return 0
+        if level == 1: return 10
+        return 10 * (2 ** (level - 1))
+
+    def check_level_up(self, imp):
+        # While XP >= Threshold, Level Up
+        # Capping at 10
+        while imp['level'] < 10:
+             thresh = self.get_level_threshold(imp['level'])
+             if imp['xp'] >= thresh:
+                 imp['xp'] -= thresh
+                 imp['level'] += 1
+             else:
+                 break
 
     def update(self):
         # Logic update for imps (1 tick per sec)
@@ -344,7 +374,7 @@ class EntityManager:
                      if t_tile and t_tile.tagged: target_valid = True
                  # If Reinforcing: Soft Rock?
                  elif imp['state'] == 'REINFORCING':
-                     if t_tile and t_tile.char == TILES_SOFT_ROCK and not t_tile.tagged: target_valid = True
+                     if t_tile and t_tile.char == TILES_SOFT_ROCK and not t_tile.tagged and t_tile.char != TILES_GOLD: target_valid = True
             
             if not target_valid and imp['state'] not in ['RETURNING_GOLD', 'IDLE']:
                 imp['target'] = None
@@ -366,23 +396,66 @@ class EntityManager:
                          imp['state'] = 'RETURNING_GOLD'
                          continue
                 
-                # Priority 1: Digging/Mining (Tagged)
                 # Divide and Conquer: Filter targets taken by other imps
-                taken_targets = set()
-                for other in self.imps:
-                    if other != imp and other['target']:
-                        taken_targets.add(other['target'])
+                # But allowing picking up dropped gold
+                desired_dropped_gold = None
                 
-                target_tile = self.map.find_nearest_tagged(ix, iy, exclude=taken_targets)
-                if target_tile:
-                    imp['target'] = (target_tile.x, target_tile.y)
-                    imp['state'] = 'MOVING_DIG'
-                else:
-                    # Priority 2: Reinforcing (Unvisited Dirt Walls)
-                    target_tile = self.map.find_nearest_reinforceable(ix, iy) # Reinforce doesn't strict need divide
-                    if target_tile:
+                # Check Priority 0: Pick up Dropped Gold (if not full)
+                if imp['gold'] < 300:
+                    # BFS for floor with gold > 0
+                    queue = [(ix, iy)]
+                    visited = set([(ix, iy)])
+                    while queue:
+                        cx, cy = queue.pop(0)
+                        t = self.map.get_tile(cx, cy)
+                        if t.char == TILES_FLOOR and t.gold_value > 0 and not t.is_solid: # Ensure valid floor
+                             desired_dropped_gold = (cx, cy)
+                             break
+                        
+                        # Limit search
+                        if len(visited) > 200: break
+                        
+                        for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0), (1, 1), (1, -1), (-1, 1), (-1, -1)]:
+                            nx, ny = cx + dx, cy + dy
+                            if 0 <= nx < self.map.width and 0 <= ny < self.map.height:
+                                if (nx, ny) not in visited:
+                                    visited.add((nx, ny))
+                                    queue.append((nx, ny))
+                
+                if desired_dropped_gold:
+                    imp['target'] = desired_dropped_gold
+                    imp['state'] = 'MOVING_PICKUP'
+                    
+                if desired_dropped_gold:
+                    imp['target'] = desired_dropped_gold
+                    imp['state'] = 'MOVING_PICKUP'
+                    
+                else: 
+                     # Priority 1: Digging/Mining (Tagged)
+                     # Density Limit Check
+                     # Max 3 imps per tile.
+                     # We must count how many imps target a specific tile.
+                     
+                     taken_counts = {}
+                     for other in self.imps:
+                         if other['target']:
+                             t = other['target']
+                             taken_counts[t] = taken_counts.get(t, 0) + 1
+                     
+                     # We exclude targets that have >= 3 imps
+                     exclude_targets = set([t for t, count in taken_counts.items() if count >= 3])
+                     
+                     
+                     target_tile = self.map.find_nearest_tagged(ix, iy, exclude=exclude_targets)
+                     if target_tile:
                         imp['target'] = (target_tile.x, target_tile.y)
-                        imp['state'] = 'MOVING_REINFORCE'
+                        imp['state'] = 'MOVING_DIG'
+                     else:
+                        # Priority 2: Reinforcing (Unvisited Dirt Walls)
+                        target_tile = self.map.find_nearest_reinforceable(ix, iy)
+                        if target_tile:
+                            imp['target'] = (target_tile.x, target_tile.y)
+                            imp['state'] = 'MOVING_REINFORCE'
             
             # 3. Act based on State
             if imp['state'] == 'RETURNING_GOLD':
@@ -448,17 +521,46 @@ class EntityManager:
                         imp['x'], imp['y'] = next_pos
             
             # 3. Act based on State
-            if imp['state'] == 'MOVING_DIG' or imp['state'] == 'MOVING_REINFORCE':
+            if imp['state'] == 'MOVING_PICKUP':
+                if not imp['target']:
+                     imp['state'] = 'IDLE'
+                     continue
+                tx, ty = imp['target']
+                if (ix, iy) == (tx, ty):
+                    # Pickup
+                    t_tile = self.map.get_tile(ix, iy)
+                    if t_tile.gold_value > 0:
+                        space = 300 - imp['gold']
+                        pickup = min(space, t_tile.gold_value)
+                        imp['gold'] += pickup
+                        t_tile.gold_value -= pickup
+                    
+                    imp['target'] = None
+                    imp['state'] = 'IDLE'
+                else:
+                    path = self.map.get_path_step(ix, iy, tx, ty)
+                    if path: 
+                        imp['x'], imp['y'] = path
+                    else:
+                        imp['target'] = None # Unreachable
+                        imp['state'] = 'IDLE'
+
+            elif imp['state'] == 'MOVING_DIG' or imp['state'] == 'MOVING_REINFORCE':
                 if not imp['target']: 
                     imp['state'] = 'IDLE' 
                     continue
                 tx, ty = imp['target']
                 t_tile = self.map.get_tile(tx, ty)
                 
-                # Check adjacency
-                dist = abs(ix - tx) + abs(iy - ty)
+                # Check adjacency (Chebyshev distance for diagonals)
+                dist_x = abs(ix - tx)
+                dist_y = abs(iy - ty)
+                dist = max(dist_x, dist_y)
                 if dist == 1:
                     # Start Working
+                    # Verify Density again? Just in case race condition in ticks?
+                    # Let's assume assignment handled it.
+                    
                     if imp['state'] == 'MOVING_DIG': imp['state'] = 'DIGGING'
                     else: imp['state'] = 'REINFORCING'
                     imp['work_timer'] = 0
@@ -475,52 +577,122 @@ class EntityManager:
                 # If Gold: Mine (+100g). If deplete (500g total), turn to floor.
                 # If Rock: Dig (1 tick) -> Floor.
                 
+                # Mining Logic (Unified)
                 if t_tile.char == TILES_GOLD:
-                    # Mining Gold
-                    mine_amt = 100
-                    took = min(mine_amt, t_tile.gold_value)
-                    t_tile.gold_value -= took
-                    imp['gold'] += took
+                     mine_amt = 100
+                     available = t_tile.gold_value
+                     
+                     # 1. Mine the rock (reduce availability)
+                     if available > mine_amt:
+                         mined = mine_amt
+                         t_tile.gold_value -= mine_amt
+                     else:
+                         mined = available
+                         t_tile.gold_value = 0
+                     
+                     # 2. Add to Imp if capacity exists
+                     space = 300 - imp['gold']
+                     to_floor = mined
+                     
+                     if space > 0:
+                         to_inv = min(mined, space)
+                         imp['gold'] += to_inv
+                         to_floor -= to_inv
                     
-                    # Full?
-                    if imp['gold'] >= 300:
-                        imp['state'] = 'RETURNING_GOLD'
-                        imp['target'] = None
-                        # Note: Tile remains tagged if valid gold left?
-                        # If we leave, tile is still tagged. Another imp can come.
-                    
-                    if t_tile.gold_value <= 0:
-                        t_tile.char = TILES_FLOOR
-                        t_tile.is_solid = False
-                        t_tile.tagged = False
-                        imp['target'] = None
-                        imp['state'] = 'IDLE' # Job Done
+                     # 3. Handle Dropped Gold
+                     # If tile destroyed, stored on floor. If not, it's effectively "loose" but invisible?
+                     # Per req: "Gold should fall on the ground in the space occupied by the destroyed block"
+                     # We only convert to floor if destroyed (value <= 0).
+                     
+                     if t_tile.gold_value <= 0:
+                         t_tile.char = TILES_FLOOR
+                         t_tile.is_solid = False
+                         t_tile.tagged = False
+                         t_tile.gold_value = to_floor + t_tile.gold_stored # Place dropped gold
+                         t_tile.gold_stored = 0
+                         imp['target'] = None
+                         imp['state'] = 'IDLE' 
+                     else:
+                         # Not destroyed yet. 
+                         # If we couldn't carry it, it is currently "lost" or should we store it?
+                         # If we don't store it, it effectively vanishes from the economy (mined but not collected).
+                         # We can put it back into the rock?
+                         # t_tile.gold_value += to_floor
+                         # If we do that, we never deplete it if we are full!
+                         # Infinite mining loop.
+                         
+                         # Req: "Imps should dig out tagged blocks even if they cannot carry any more gold."
+                         # So we MUST deplete it.
+                         # Where does "to_floor" go?
+                         # Maybe we can add a 'dropped_gold' field to Tile distinct from 'gold_value'?
+                         # Or just assume it spawns when the rock breaks?
+                         # If I can't store it on the Gold Block, maybe I should assume it accumulates and drops at the end?
+                         # Let's use a temporary attribute or just assume it is lost until the final break?
+                         # Actually, to fail safe, let's just add it back to gold_value for now?
+                         # NO, that violates "Dig out even if full".
+                         
+                         # Hack: Store it in `gold_stored`? (Used for Treasury).
+                         # Gold tiles don't use gold_stored.
+                         t_tile.gold_stored += to_floor
+                         pass
+                     
+                     if imp['gold'] >= 300 and t_tile.gold_value <= 0:
+                         imp['state'] = 'RETURNING_GOLD'
                 elif t_tile.char == TILES_REINFORCED:
-                    # Reinforced digging takes longer (2 ticks)
-                    imp['work_timer'] += 1
-                    if imp['work_timer'] >= 2:
+                    # Reinforced digging takes longer
+                    # Use Progress. Reinforced Wall HP = 200 (approx 2 sec for lvl 1 imp?)
+                    # Each tick adds 10 * lvl progress?
+                    # Previous was 2 ticks.
+                    # Let's say HP = 20.
+                    # Imp adds 10 * level.
+                    power = 10 * imp['level']
+                    t_tile.progress += power
+                    
+                    # Grant XP
+                    imp['xp'] += 1
+                    self.check_level_up(imp)
+
+                    if t_tile.progress >= 20:
                         t_tile.char = TILES_FLOOR
                         t_tile.is_solid = False
                         t_tile.tagged = False
+                        t_tile.progress = 0
                         imp['target'] = None
                         imp['state'] = 'IDLE'
-                        imp['work_timer'] = 0
                 else:
-                    # Normal Dig
-                    t_tile.char = TILES_FLOOR
-                    t_tile.is_solid = False
-                    t_tile.tagged = False
-                    imp['target'] = None
-                    imp['state'] = 'IDLE'
+                    # Normal Dig (Soft Rock)
+                    # HP = 10.
+                    power = 10 * imp['level']
+                    t_tile.progress += power
+                    
+                    imp['xp'] += 1
+                    self.check_level_up(imp)
+                    
+                    if t_tile.progress >= 10:
+                        t_tile.char = TILES_FLOOR
+                        t_tile.is_solid = False
+                        t_tile.tagged = False
+                        t_tile.progress = 0
+                        imp['target'] = None
+                        imp['state'] = 'IDLE'
 
             elif imp['state'] == 'REINFORCING':
                 tx, ty = imp['target']
                 t_tile = self.map.get_tile(tx, ty)
                 
-                imp['work_timer'] += 1
-                if imp['work_timer'] >= 3:
+                # Reinforce logic
+                # Target: Soft Rock.
+                # HP to become Reinforced: 30.
+                power = 10 * imp['level']
+                t_tile.progress += power
+
+                imp['xp'] += 1
+                self.check_level_up(imp)
+
+                if t_tile.progress >= 30:
                     t_tile.char = TILES_REINFORCED
                     t_tile.is_solid = True # Should be solid
+                    t_tile.progress = 0
                     imp['target'] = None
                     imp['state'] = 'IDLE'
             
@@ -618,7 +790,12 @@ class Renderer:
                                char = TILES_SOFT_ROCK # Keep the texture char '"'
                                # char = ' ' # Legacy: Deep rock invisible/space
                    
-                   if char == TILES_FLOOR: pair = COLOR_FLOOR
+                   if char == TILES_FLOOR: 
+                       pair = COLOR_FLOOR
+                       if tile.gold_value > 0: # Dropped Gold
+                           pair = COLOR_GOLD
+                           char = '.' # Keep dot? Or 'o'? User said "Gold... fall on ground". 
+                           # Let's start with Color.
                    elif char == TILES_HEART: pair = COLOR_HEART
                    elif char == TILES_PORTAL: pair = COLOR_PORTAL
                    elif char == TILES_GOLD: pair = COLOR_GOLD
@@ -627,6 +804,7 @@ class Renderer:
                    
                    attr = curses.color_pair(pair)
                    if tile.tagged:
+                       # Invert Yellow for Tagged (Use standard pair which is Black on Yellow BG)
                        attr = curses.color_pair(COLOR_SELECT)
                    
                    # Treasury logic
@@ -642,7 +820,7 @@ class Renderer:
                             # Highlight logic for drag
                             # "highlight all blocks to be changed rather than just the origin block"
                             # We just highlight everything in the rect
-                            attr = curses.color_pair(COLOR_SELECT) | curses.A_REVERSE
+                            attr = curses.color_pair(COLOR_SELECT)
 
                    try:
                        self.stdscr.addch(y, x, char, attr)
@@ -668,17 +846,41 @@ class Renderer:
                 except curses.error: pass
 
         # Draw UI
-        status = f"Pos: {self.cam_x},{self.cam_y} | Room: {selected_room} | Gold: {total_gold} | Paused: {str(paused)}"
-        # Pads with spaces to clear line
-        status = status.ljust(w-1) 
+        # Status Line Logic
+        status_text = ""
+        
+        # Priority 1: Pause State
+        if paused:
+            status_text = "PAUSED "
+            
+        # Priority 2: Inspection (Append)
+        if hasattr(self, 'selected_entity') and self.selected_entity:
+            # Check if entity is still alive/valid? (Imps uses dicts, so ref keeps it alive, but maybe removed from list?)
+            # Assuming safe.
+            ent = self.selected_entity
+            status_text += f"| {ent.get('name', '???')} Lvl:{ent.get('level',1)} XP:{ent.get('xp',0)} Gold:{ent.get('gold',0)} State:{ent.get('state')} "
+        
+        # Base info
+        base_info = f"| Pos: {self.cam_x},{self.cam_y} | Room: {selected_room} | Gold: {total_gold} "
+        final_status = (status_text + base_info).strip()
+        
+        # Always draw the status line background to clear artifacts
+        # Using a blank string with standard colors? Or inverted bar?
+        # User said: "The status line is now missing... Paused or unpaused it is not there."
+        # This implies we weren't drawing the space when unpaused.
+        # Let's draw the full width bar.
         
         try:
-            self.stdscr.addstr(h-1, 0, status[:w-1])
+             # Draw Background
+             self.stdscr.addstr(h-1, 0, " " * (w-1))
+             # Draw Text
+             if final_status:
+                self.stdscr.addstr(h-1, 0, final_status[:w-1])
         except curses.error: pass
-
+        
         # Draw Pause Border
         if paused:
-            self.stdscr.border()
+             self.stdscr.border()
 
         if paused:
             self.stdscr.border()
@@ -1011,6 +1213,23 @@ class Game:
                     if bstate & curses.BUTTON1_PRESSED:
                         self.drag_start = (map_x, map_y)
                         self.drag_end = (map_x, map_y)
+                        
+                        # Inspect Logic (Click)
+                        # We also set selected_entity on press? Or release?
+                        # Usually release is safer for "Click vs Drag". 
+                        # But simple click:
+                        clicked_imp = None
+                        for imp in self.entities.imps:
+                             if imp['x'] == map_x and imp['y'] == map_y:
+                                 clicked_imp = imp
+                                 break
+                        
+                        self.selected_entity = clicked_imp
+                        # Does not clear on empty click?
+                        # If clicked_imp is None, we clear it.
+                        # Unless dragging!
+                        # If we start dragging, we probably ignore inspection updates later?
+                        # For now, simple override.
                     
                     # Update Drag Position
                     # In standard curses, if REPORT_MOUSE_POSITION is on, any mouse event sends KEY_MOUSE.
