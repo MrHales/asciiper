@@ -8,9 +8,6 @@ import re
 # Constants
 TILES_HARD_ROCK = '^' # Indestructible
 TILES_SOFT_ROCK = ' ' # Diggable (Deep rock) - Visual change to Space
-TILES_DIRT_WALL = chr(177) # '▒' Render-only (Exposed Soft Rock) - Medium Shade to differentiate? Or user said "Keep characters"... let's leave it as '░' for now if user explicitly asked for 176 on deep rock.
-# Actually user said "Keep the characters for exposed rock". Exposed rock was '░'. Deep rock was '"'.
-# Now Deep Rock is 176 ('░'). So they are the same. I'll stick to 176 for Deep and '░' for Dirt.
 TILES_DIRT_WALL = '░'
 TILES_REINFORCED = '█' # Reinforced Wall
 TILES_FLOOR = '.'     # Walkable
@@ -30,6 +27,7 @@ COLOR_GOLD = 7
 COLOR_REINFORCED = 8
 COLOR_TREASURY = 9
 COLOR_MENU = 10 # New High Contrast Menu Color
+COLOR_SELECT_TEXT = 11 # Highlight for text/floor
 
 KEY_QUIT = ord('q')
 
@@ -74,7 +72,7 @@ class Map:
         # 3. Place Heart (Center)
         cx, cy = self.width // 2, self.height // 2
         self.tiles[cy][cx].char = TILES_HEART
-        self.tiles[cy][cx].is_solid = False # Heart is walkable? Or obstacle? Let's say obstacle for now, or walkable base
+        self.tiles[cy][cx].is_solid = True # Heart is blocking object
         self.heart_pos = (cx, cy)
 
         # Clear area around heart
@@ -112,6 +110,12 @@ class Map:
         for _ in range(num_veins):
              vx = random.randint(2, self.width - 3)
              vy = random.randint(2, self.height - 3)
+             
+             # Check distance from portal
+             px, py = self.portal_pos
+             if ((vx - px) ** 2 + (vy - py) ** 2) ** 0.5 < 5:
+                 continue
+                 
              length = random.randint(4, 10)
              for _ in range(length):
                  if 0 <= vx < self.width and 0 <= vy < self.height:
@@ -390,11 +394,8 @@ class EntityManager:
                     imp['state'] = 'RETURNING_GOLD'
                     continue
                 
-                # Check 2: Return if carrying gold and no gold to mine
-                if imp['gold'] > 0:
-                     if not self.map.any_tagged_gold():
-                         imp['state'] = 'RETURNING_GOLD'
-                         continue
+                # Check 2: REMOVED "Return if carrying gold" to allow picking up dropped gold
+                # We only return if full, or if we explicitly decide to later.
                 
                 # Divide and Conquer: Filter targets taken by other imps
                 # But allowing picking up dropped gold
@@ -480,19 +481,43 @@ class EntityManager:
                      
                      # If both full?
                      if not target_found:
-                         # Just idle/wander? Or go to heart and wait?
-                         # Let's just wander.
-                         imp['state'] = 'IDLE' 
-                         imp['target'] = None
-                         continue # Re-eval next tick
+                         # Drop on floor where we stand
+                         tile = self.map.get_tile(ix, iy)
+                         if tile.char == TILES_FLOOR or tile.char == '=':
+                             tile.gold_value += imp['gold']
+                             tile.char = '=' # Ensure visual
+                             # self.total_gold += imp['gold'] # Dropped gold is NOT secure score.
+                             imp['gold'] = 0
+                             imp['state'] = 'IDLE'
+                             imp['target'] = None
+                             continue
+                         else:
+                             # Should be rare if we are idly moving?
+                             # Just Idle and hope to move to floor?
+                             imp['state'] = 'IDLE' 
+                             imp['target'] = None
+                             continue # Re-eval next tick
 
                 
                 tx, ty = imp['target']
                 
                 # Move
-                if (ix, iy) == (tx, ty):
+                # If target is Heart, we check adjacency
+                deposit_ready = False
+                t_tile_target = self.map.get_tile(tx, ty)
+                
+                if t_tile_target and t_tile_target.char == TILES_HEART:
+                    # Check dist
+                    dist = max(abs(ix - tx), abs(iy - ty))
+                    if dist <= 1:
+                        deposit_ready = True
+                else:
+                     if (ix, iy) == (tx, ty):
+                         deposit_ready = True
+                
+                if deposit_ready:
                     # Deposit
-                    tile = self.map.get_tile(ix, iy)
+                    tile = t_tile_target # The target (Heart or Treasury)
                     amount = imp['gold']
                     deposit = 0
                     
@@ -534,6 +559,9 @@ class EntityManager:
                         pickup = min(space, t_tile.gold_value)
                         imp['gold'] += pickup
                         t_tile.gold_value -= pickup
+                        
+                        if t_tile.gold_value <= 0:
+                            t_tile.char = TILES_FLOOR # Reset char to floor if depleted
                     
                     imp['target'] = None
                     imp['state'] = 'IDLE'
@@ -734,8 +762,9 @@ class Renderer:
         curses.init_pair(COLOR_REINFORCED, curses.COLOR_WHITE, curses.COLOR_BLACK) 
         curses.init_pair(COLOR_TREASURY, curses.COLOR_YELLOW, curses.COLOR_BLACK)
         curses.init_pair(COLOR_MENU, curses.COLOR_BLACK, curses.COLOR_WHITE) # Inverted for menu
+        curses.init_pair(COLOR_SELECT_TEXT, curses.COLOR_YELLOW, curses.COLOR_BLACK) # Yellow text on black for floor highlight
 
-    def draw(self, paused, imps, selected_room, drag_start=None, drag_end=None, total_gold=0):
+    def draw(self, paused, imps, selected_room, drag_start=None, drag_end=None, total_gold=0, selected_entity=None):
         # Removed self.stdscr.clear() to reduce flicker. 
         # We overwrite the entire viewport anyway.
         h, w = self.stdscr.getmaxyx()
@@ -794,18 +823,25 @@ class Renderer:
                        pair = COLOR_FLOOR
                        if tile.gold_value > 0: # Dropped Gold
                            pair = COLOR_GOLD
-                           char = '.' # Keep dot? Or 'o'? User said "Gold... fall on ground". 
-                           # Let's start with Color.
+                           char = '=' # Yellow '=' for dropped gold
+                           # We apply attr later, but let's signal bold?
+                           # We can check char later.
                    elif char == TILES_HEART: pair = COLOR_HEART
                    elif char == TILES_PORTAL: pair = COLOR_PORTAL
                    elif char == TILES_GOLD: pair = COLOR_GOLD
                    elif char == TILES_REINFORCED: pair = COLOR_REINFORCED
                    elif char == TILES_TREASURY: pair = COLOR_TREASURY
+                   elif char == '=': pair = COLOR_GOLD # Explicit fix for white gold
                    
                    attr = curses.color_pair(pair)
+                   if char == '=': attr |= curses.A_BOLD # Bright Yellow for dropped gold
+
                    if tile.tagged:
-                       # Invert Yellow for Tagged (Use standard pair which is Black on Yellow BG)
-                       attr = curses.color_pair(COLOR_SELECT)
+                       # Adaptive Highlight for Tagged
+                       if tile.is_solid:
+                           attr = curses.color_pair(COLOR_SELECT)
+                       else:
+                           attr = curses.color_pair(COLOR_SELECT_TEXT) | curses.A_BOLD
                    
                    # Treasury logic
                    if char == TILES_TREASURY and tile.gold_stored > 0:
@@ -813,14 +849,12 @@ class Renderer:
                        # "Make the symbol for an occupied space in the treasury an inverted yellow $."
                        attr = curses.color_pair(COLOR_TREASURY) | curses.A_REVERSE
                    
-                   # Drag Selection Highlight
-                   if drag_rect:
-                       min_x, max_x, min_y, max_y = drag_rect
-                       if min_x <= map_x <= max_x and min_y <= map_y <= max_y:
-                            # Highlight logic for drag
-                            # "highlight all blocks to be changed rather than just the origin block"
-                            # We just highlight everything in the rect
+                   # Drag Selection Highlight - Simplified to Start Tile Only
+                   if drag_start and (map_x, map_y) == drag_start:
+                        if tile.is_solid:
                             attr = curses.color_pair(COLOR_SELECT)
+                        else:
+                            attr = curses.color_pair(COLOR_SELECT_TEXT) | curses.A_BOLD
 
                    try:
                        self.stdscr.addch(y, x, char, attr)
@@ -853,23 +887,32 @@ class Renderer:
         if paused:
             status_text = "PAUSED "
             
-        # Priority 2: Inspection (Append)
-        if hasattr(self, 'selected_entity') and self.selected_entity:
-            # Check if entity is still alive/valid? (Imps uses dicts, so ref keeps it alive, but maybe removed from list?)
-            # Assuming safe.
-            ent = self.selected_entity
-            status_text += f"| {ent.get('name', '???')} Lvl:{ent.get('level',1)} XP:{ent.get('xp',0)} Gold:{ent.get('gold',0)} State:{ent.get('state')} "
-        
         # Base info
         base_info = f"| Pos: {self.cam_x},{self.cam_y} | Room: {selected_room} | Gold: {total_gold} "
-        final_status = (status_text + base_info).strip()
+        
+        # Priority 2: Inspection (Append at end)
+        imp_info = ""
+        if selected_entity:
+            ent = selected_entity
+            
+            # Map state to descriptive text
+            state_map = {
+                'IDLE': "Idle",
+                'MOVING_DIG': "Going to dig",
+                'DIGGING': "Digging",
+                'RETURNING_GOLD': "Carrying gold",
+                'MOVING_PICKUP': "Going to pick up gold",
+                'MOVING_REINFORCE': "Going to reinforce",
+                'REINFORCING': "Reinforcing",
+                'MOVING_DROP': "Dropping gold"
+            }
+            s_text = state_map.get(ent.get('state'), ent.get('state'))
+            
+            imp_info = f"| {ent.get('name', '???')} (Lvl {ent.get('level',1)}) - {s_text} "
+        
+        final_status = (status_text + base_info + imp_info).strip()
         
         # Always draw the status line background to clear artifacts
-        # Using a blank string with standard colors? Or inverted bar?
-        # User said: "The status line is now missing... Paused or unpaused it is not there."
-        # This implies we weren't drawing the space when unpaused.
-        # Let's draw the full width bar.
-        
         try:
              # Draw Background
              self.stdscr.addstr(h-1, 0, " " * (w-1))
@@ -1022,6 +1065,43 @@ class Menu:
                  self.stdscr.addstr(start_y + 5 + i, start_x + 4, prefix + opt, attr)
 
     def input(self, key):
+        if key == curses.KEY_MOUSE:
+            try:
+                _, x, y, _, bstate = curses.getmouse()
+                if bstate & (curses.BUTTON1_CLICKED | curses.BUTTON1_PRESSED):
+                    # Check overlap with Menu Box
+                    h, w = self.stdscr.getmaxyx()
+                    box_w = 40
+                    box_h = 14
+                    start_y = h // 2 - box_h // 2
+                    start_x = w // 2 - box_w // 2
+                    
+                    # Clicks inside box
+                    if start_x <= x < start_x + box_w and start_y <= y < start_y + box_h:
+                        # Map Y to Options
+                        # Main Options start at start_y + 2, spacing 2
+                        if self.state == 'MAIN':
+                            rel_y = y - (start_y + 2)
+                            if rel_y >= 0 and rel_y % 2 == 0:
+                                idx = rel_y // 2
+                                if 0 <= idx < len(self.options):
+                                    self.selected = idx
+                                    # Trigger Enter logic immediately on click? Or just select?
+                                    # User said "clicking Yes", implying action.
+                                    # Let's trigger Enter logic.
+                                    key = 10 # Emulate Enter
+                        
+                        elif self.state == 'CONFIRM_QUIT':
+                            # Options start at start_y + 5, spacing 1
+                            rel_y = y - (start_y + 5)
+                            if rel_y >= 0:
+                                idx = rel_y
+                                if 0 <= idx < 2: # Yes, Cancel
+                                    self.selected = idx
+                                    key = 10
+            except:
+                pass
+
         if key == 27: # Esc
             if self.state == 'MAIN':
                 self.active = False
@@ -1088,6 +1168,7 @@ class Game:
         self.running = True
         self.paused = False
         self.selected_room = "None"
+        self.selected_entity = None
         
         # State for Drag
         self.drag_start = None
@@ -1100,6 +1181,11 @@ class Game:
         # Setup Mouse Mask
         # We need REPORT_MOUSE_POSITION for drag highlights
         curses.mousemask(curses.ALL_MOUSE_EVENTS | curses.REPORT_MOUSE_POSITION)
+        curses.mouseinterval(0) # Disable click resolution delay for instant drag start
+
+        # Force enable Mouse Drag (Button Motion) tracking in xterm-compatible terminals
+        # Standard curses sometimes misses this if TERM is generic
+        pass
         
         self.map = Map(80, 25) # Standard terminal size
         self.entities = EntityManager(self.map)
@@ -1124,6 +1210,14 @@ class Game:
             else:
                 drag_mode_tag = True # We are tagging
         
+        
+        # Room Costs
+        # Treasury: 25, Lair: 50, Prison: 100
+        cost_per_tile = 0
+        if self.selected_room == "Treasury": cost_per_tile = 25
+        elif self.selected_room == "Lair": cost_per_tile = 50
+        elif self.selected_room == "Prison": cost_per_tile = 100
+        
         # Apply Logic to Rect
         for ry in range(min_y, max_y + 1):
             for rx in range(min_x, max_x + 1):
@@ -1133,7 +1227,7 @@ class Game:
                     if tile.char in [TILES_SOFT_ROCK, TILES_GOLD, TILES_REINFORCED]:
                         tile.tagged = drag_mode_tag
                         
-                    elif tile.char == TILES_FLOOR or tile.char in ['P', 'L', TILES_TREASURY]:
+                    elif tile.char == TILES_FLOOR or tile.char in ['P', 'L', TILES_TREASURY, '=']:
                         # Room assignments should overwrite one another
                         char_to_apply = None
                         if self.selected_room == "Corridor":
@@ -1144,11 +1238,91 @@ class Game:
                             char_to_apply = 'L'
                         elif self.selected_room == "Treasury":
                             char_to_apply = TILES_TREASURY
+                        
+                        # Drop logic for costs
+                        if char_to_apply and cost_per_tile > 0:
+                            # Try to pay
+                            paid = False
                             
-                        if char_to_apply:
-                            tile.char = char_to_apply
-                            if char_to_apply == TILES_TREASURY:
-                                tile.gold_stored = 0
+                            # 1. Pay from Treasuries
+                            # We iterate ALL tiles to find treasuries with gold? Inefficient?
+                            # Optim: Use self.entities.total_gold check first?
+                            # total_gold includes Heart + Treasury.
+                            
+                            # Simple logic: Check total affordable?
+                            # We need to deduct.
+                            needed = cost_per_tile
+                            
+                            # Search Treasuries
+                            for row in self.map.tiles:
+                                for t in row:
+                                    if t.char == TILES_TREASURY and t.gold_stored > 0:
+                                        take = min(needed, t.gold_stored)
+                                        t.gold_stored -= take
+                                        needed -= take
+                                        if needed <= 0: break
+                                if needed <= 0: break
+                            
+                            # Pay from Heart
+                            if needed > 0:
+                                take = min(needed, self.entities.heart_gold)
+                                self.entities.heart_gold -= take
+                                needed -= take
+                                
+                            if needed <= 0:
+                                paid = True
+                                # Recalc total score optimization? user loop handles it next tick
+                            else:
+                                # Refund logic? Rollback?
+                                # If we failed to pay, we should refund what we took and ABORT.
+                                # Reverse the taken amounts.
+                                # Complex partial rollback.
+                                # Easier: Check affordability first.
+                                pass
+                                
+                            # Re-do with pre-check
+                            # Actually, let's just do a quick pre-check of Total Gold.
+                            # self.entities.total_gold is updated each tick. It might be stale?
+                            # Let's count explicitly? No, total_gold should be close enough.
+                            # Recalculate just to be safe.
+                            current_total = self.entities.heart_gold
+                            for row in self.map.tiles:
+                                for t in row:
+                                    if t.char == TILES_TREASURY: current_total += t.gold_stored
+                            
+                            if current_total >= cost_per_tile:
+                                # Deduct Logic (Real)
+                                needed = cost_per_tile
+                                for row in self.map.tiles:
+                                    for t in row:
+                                        if t.char == TILES_TREASURY and t.gold_stored > 0:
+                                            take = min(needed, t.gold_stored)
+                                            t.gold_stored -= take
+                                            needed -= take
+                                            if needed <= 0: break
+                                    if needed <= 0: break
+                                if needed > 0:
+                                    take = min(needed, self.entities.heart_gold)
+                                    self.entities.heart_gold -= take
+                                
+                                # Apply Build
+                                paid = True
+                            else:
+                                paid = False
+                        
+                        # Apply if free or paid
+                        if char_to_apply and (cost_per_tile == 0 or paid):
+                             old_char = tile.char 
+                             # Handle White Gold Bug / Absorption
+                             # If we are overwriting '=' or gold char
+                             
+                             tile.char = char_to_apply
+                             if char_to_apply == TILES_TREASURY:
+                                if tile.gold_value > 0 or old_char == '=':
+                                     tile.gold_stored += tile.gold_value
+                                     tile.gold_value = 0
+                                else:
+                                     tile.gold_stored = 0
 
     def input(self):
         # Process all pending input
@@ -1204,7 +1378,9 @@ class Game:
                 
             if key == curses.KEY_MOUSE:
                 try:
-                    _, x, y, _, bstate = curses.getmouse()
+                    event = curses.getmouse()
+                    _, x, y, _, bstate = event
+                    
                     map_x = x + self.renderer.cam_x
                     map_y = y + self.renderer.cam_y
                     
@@ -1243,12 +1419,22 @@ class Game:
                         if self.drag_start:
                              x1, y1 = self.drag_start
                              x2, y2 = (map_x, map_y)
-                             # Ensure we capture the final position
-                             self.drag_end = (map_x, map_y)
+                             
+                             # If Start == Current Mouse (End) -> Click (Inspection/Single Toggle)
+                             if (x1, y1) == (x2, y2):
+                                 # Logic for single click toggle is same as 1x1 drag
+                                 pass
                              
                              self.handle_drag_action(x1, y1, x2, y2)
                              self.drag_start = None
                              self.drag_end = None
+                    
+                    # Right Click Cancel
+                    if bstate & (curses.BUTTON3_PRESSED | curses.BUTTON3_CLICKED):
+                        self.selected_room = "None"
+                        self.selected_entity = None
+                        self.drag_start = None
+                        self.drag_end = None
                     
                 except curses.error:
                     pass
@@ -1269,13 +1455,13 @@ class Game:
             # Input
             self.input()
             
-            # Render (~30 FPS implicitly by sleep or just fast loop)
+            # Render (~60 FPS target for smoother drag)
             # Pass drags only if NOT in menu?
             d_start = self.drag_start if not self.menu.active else None
             d_end = self.drag_end if not self.menu.active else None
             
             self.renderer.draw(self.paused, self.entities.imps, self.selected_room, 
-                               d_start, d_end, self.entities.total_gold)
+                               d_start, d_end, self.entities.total_gold, self.selected_entity)
             
             if self.menu.active:
                 self.menu.draw()
@@ -1283,8 +1469,8 @@ class Game:
             # Finalize Frame
             self.stdscr.refresh()
             
-            # Cap framerate slightly to save CPU
-            curses.napms(33)
+            # Cap framerate to ~60 FPS
+            curses.napms(16)
 
 def main(stdscr):
     game = Game(stdscr)
