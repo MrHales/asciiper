@@ -16,6 +16,8 @@ TILES_PORTAL = 'O'
 TILES_IMP = 'i'
 TILES_GOLD = 'o'      # Diggable Gold
 TILES_TREASURY = '$'  # Treasury Floor
+TILES_BED = 'B'       # Lair Bed
+TILES_TRAINING = 'T'  # Training Dummy
 
 COLOR_ROCK = 1
 COLOR_FLOOR = 2
@@ -26,8 +28,14 @@ COLOR_SELECT = 6
 COLOR_GOLD = 7
 COLOR_REINFORCED = 8
 COLOR_TREASURY = 9
-COLOR_MENU = 10 # New High Contrast Menu Color
-COLOR_SELECT_TEXT = 11 # Highlight for text/floor
+COLOR_MENU = 10 
+COLOR_SELECT_TEXT = 11
+COLOR_BED = 12
+COLOR_TRAINING = 13
+COLOR_DUMMY = 14
+
+TILES_TRAINING = 'T'
+# Note: 'O' is used for Dummy in code logic, not a constant yet, but we'll use 'O' string
 
 KEY_QUIT = ord('q')
 
@@ -307,32 +315,103 @@ class Map:
                         queue.append((nx, ny))
         return None
 
+    def count_room_tiles(self, tile_char):
+        count = 0
+        for row in self.tiles:
+            for t in row:
+                if t.char == tile_char:
+                    count += 1
+        return count
+    
+    def is_valid_bed_spot(self, x, y):
+        # Must be Lair ('L')
+        # Must NOT be adjacent to another Bed ('B')
+        # Neighbors 8-way? Or Manhatten?
+        # "at least one empty (Lair) space away from one another"
+        # implies if I am at X, X+1 cannot be bed. X+2 can.
+        # So check immediate neighbors (including diagonals to be safe/neat)
+        
+        tile = self.get_tile(x, y)
+        if not tile or tile.char != 'L': return False
+        
+        for dx in [-1, 0, 1]:
+            for dy in [-1, 0, 1]:
+                if dx == 0 and dy == 0: continue
+                nx, ny = x + dx, y + dy
+                nt = self.get_tile(nx, ny)
+                if nt and nt.char == TILES_BED:
+                    return False
+        return True
+
 class EntityManager:
     def __init__(self, game_map):
         self.map = game_map
-        self.imps = []
-        self.total_gold = 0 # Legacy total?
+        self.creatures = [] # Renamed from imps
+        self.ids = 0
+        self.total_gold = 0 
         self.heart_gold = 0
+        self.payday_timer = 0
+        self.spawn_timer = 0
+        self.bed_ownership = {} # (x,y) -> creature_id
+        
         # Spawn initial imps
         hx, hy = self.map.heart_pos
         for _ in range(4): # Spawn 4
-            self.spawn_imp(hx, hy)
+            self.spawn_creature('IMP', hx, hy)
 
-    def spawn_imp(self, x, y):
+    def spawn_creature(self, c_type, x, y):
         # Added tick_offset to randomize updates or idle timing
-        names = ["Op", "Baz", "Fo", "Zot", "Taw", "Bip", "Mog", "Gub"]
-        name = random.choice(names)
-        self.imps.append({
+        names_imp = ["Op", "Baz", "Fo", "Zot", "Taw", "Bip", "Mog", "Gub"]
+        names_gobar = ["Grom", "Throk", "Varg", "Krug", "Drak", "Murn", "Zog", "Ruk"]
+        
+        name = random.choice(names_imp) if c_type == 'IMP' else random.choice(names_gobar)
+        
+        # Base stats
+        c = {
+            'id': self.ids,
+            'type': c_type,
             'x': x, 'y': y, 
             'state': 'IDLE', 
             'target': None, 
             'idle_timer': 0,
             'gold': 0,
-            'work_timer': 0, # Still used for anim/state? Or purely tile progress now?
+            'work_timer': 0, 
             'name': name,
             'level': 1,
-            'xp': 0
-        })
+            'xp': 0,
+            'health': 0,
+            'max_health': 0,
+            'damage': 0,
+            'wage': 0,
+            'happiness': 0,
+            'unconscious': False
+        }
+        self.ids += 1
+        
+        if c_type == 'IMP':
+            c['max_health'] = 50
+            c['health'] = 50
+            c['damage'] = 5
+            c['wage'] = 0 # Imps don't get paid
+        elif c_type == 'GOBAR':
+            c['max_health'] = 150
+            c['health'] = 150
+            c['damage'] = 30
+            c['wage'] = 5 # Starts at 5
+        elif c_type == 'DUMMY':
+            c['max_health'] = 9999
+            c['health'] = 9999
+            c['damage'] = 0
+            c['wage'] = 0
+            c['state'] = 'STATIC'
+            c['name'] = "Dummy"
+        
+        self.creatures.append(c)
+
+    # Legacy alias property for rendering
+    @property
+    def imps(self):
+        return self.creatures
 
     def get_level_threshold(self, level):
         # Starting level 1. Level 2 takes 10 xp.
@@ -344,29 +423,278 @@ class EntityManager:
         if level == 1: return 10
         return 10 * (2 ** (level - 1))
 
-    def check_level_up(self, imp):
+    def check_level_up(self, c):
         # While XP >= Threshold, Level Up
         # Capping at 10
-        while imp['level'] < 10:
-             thresh = self.get_level_threshold(imp['level'])
-             if imp['xp'] >= thresh:
-                 imp['xp'] -= thresh
-                 imp['level'] += 1
+        while c['level'] < 10:
+             thresh = self.get_level_threshold(c['level'])
+             if c['xp'] >= thresh:
+                 c['xp'] -= thresh
+                 c['level'] += 1
+                 # Stat Up
+                 c['max_health'] += int(c['max_health'] * 0.1)
+                 c['health'] = c['max_health']
+                 c['damage'] += int(c['damage'] * 0.1)
+                 if c['type'] == 'GOBAR':
+                     c['wage'] += 1
              else:
                  break
 
     def update(self):
-        # Logic update for imps (1 tick per sec)
-        for imp in self.imps:
-            ix, iy = imp['x'], imp['y']
+        # 0. Global Logic
+        
+        # Payday Timer (Once per 240 ticks)
+        self.payday_timer += 1
+        if self.payday_timer >= 240:
+            self.payday_timer = 0
+            # Announce Payday? (Renderer can check self.payday_timer == 0 or similar state)
+            # Trigger Wage Seeking
+            for c in self.creatures:
+                if c['wage'] > 0 and c['state'] != 'UNCONSCIOUS':
+                    c['state'] = 'SEEKING_WAGE'
+                    c['target'] = None
+                    # Happiness penalty if they don't get paid will be handled when they fail?
+                    # For now just reset status logic.
+
+        # Spawn Go'barr Check
+        # Lair >= 10, Treasury >= 10, Portal exists. max 10 gobars.
+        gobars = [c for c in self.creatures if c['type'] == 'GOBAR']
+        
+        self.spawn_timer -= 1
+        
+        if len(gobars) < 10 and self.spawn_timer <= 0:
+             # Check Conditions
+             lair_size = self.map.count_room_tiles('L')
+             treasury_size = self.map.count_room_tiles(TILES_TREASURY)
+             
+             if lair_size >= 10 and treasury_size >= 10:
+                 has_space = False
+                 # Limit 20 creatures
+                 if len(self.creatures) < 20: 
+                      # Find valid bed spot to ensure cap isn't exceeded by space
+                      for y in range(self.map.height):
+                          for x in range(self.map.width):
+                              if self.map.is_valid_bed_spot(x, y):
+                                  has_space = True
+                                  break
+                          if has_space: break
+                 
+                 if has_space:
+                      px, py = self.map.portal_pos
+                      self.spawn_creature('GOBAR', px, py)
+                      self.spawn_timer = random.randint(30, 60)
+
+        # Logic update for creatures (1 tick per sec)
+        for c in self.creatures:
+            ix, iy = c['x'], c['y']
             
-            # STATE TRANSITION LOGIC
+            # State: UNCONSCIOUS
+            if c['health'] <= 0:
+                c['state'] = 'UNCONSCIOUS'
+                c['unconscious'] = True
+                # No actions. Imps drag them?
+                continue
             
-            # 0. If Returning Gold (Optimized state check)
-            # Legacy block removed. Logic is handled in Step 3.
+            # Regen?
             pass
 
+            # STATE TRANSITION LOGIC
+            
+            # 1. SEEKING_WAGE
+            if c['state'] == 'SEEKING_WAGE':
+                 # Find Treasury or Heart with gold?
+                 # Actually just need to reach it to get "paid" (deduct from treasury).
+                 if not c['target']:
+                      # Find nearest Treasury/Heart with gold > c['wage']
+                      # Simplified: Go to Heart preferably or Treasury.
+                      t = self.map.find_nearest_treasury_space(ix, iy) # Usage reuse? This finds unfilled treasury.
+                      # We need ANY treasury.
+                      
+                      # Find any treasury/heart
+                      targets = []
+                      if self.heart_gold >= c['wage']:
+                           targets.append(self.map.heart_pos)
+                      
+                      # Scan treasuries
+                      # Optimize: Nearest BFS search for char '$' or '♥'
+                      # Reuse logic?
+                      # Let's just walk to Heart for now as fallback.
+                      c['target'] = self.map.heart_pos
+                 
+                 tx, ty = c['target']
+                 # Move
+                 dist = max(abs(ix - tx), abs(iy - ty))
+                 if dist <= 1:
+                     # Pay
+                     paid = False
+                     # Deduct logic simplified for prototype
+                     if self.heart_gold >= c['wage']:
+                         self.heart_gold -= c['wage']
+                         paid = True
+                     # Else check treasury tiles around?
+                     
+                     if paid:
+                         c['state'] = 'IDLE'
+                         c['target'] = None
+                         c['happiness'] = min(10, c['happiness'] + 1)
+                     else:
+                         # Failed to pay? Unhappy?
+                         c['state'] = 'IDLE' # Give up for now
+                         c['happiness'] = max(-10, c['happiness'] - 1)
+                 else:
+                      path = self.map.get_path_step(ix, iy, tx, ty)
+                      if path: c['x'], c['y'] = path
+                 continue
+            
+            # 2. Go'barr Specific: Bed Construction
+            if c['type'] == 'GOBAR' and c['state'] == 'IDLE':
+                # Check if I own a bed
+                my_bed_pos = None
+                for pos, owner_id in self.bed_ownership.items():
+                    if owner_id == c['id']:
+                        my_bed_pos = pos
+                        break
+                
+                if not my_bed_pos:
+                    # Need to build a bed
+                     # Find valid spot
+                    if not c.get('building_bed'):
+                        target_spot = None
+                        # BFS for Valid Bed Spot
+                        q = [(ix, iy)]
+                        visited = set([(ix, iy)])
+                        found = False
+                        
+                        # Optimization: Random search or full scan?
+                        # Scanning entire map is expensive.
+                        # Scan 'L' tiles?
+                        
+                        # Simplified: Scan neighborhood first, then global?
+                        # Let's just iterate Lair tiles if we can track them...
+                        # Or just reuse BFS.
+                        
+                        while q:
+                            cx, cy = q.pop(0)
+                            if self.map.is_valid_bed_spot(cx, cy):
+                                target_spot = (cx, cy)
+                                found = True
+                                break
+                            if len(visited) > 800: break # Increased limit
+                            for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+                                nx, ny = cx + dx, cy + dy
+                                if 0 <= nx < self.map.width and 0 <= ny < self.map.height:
+                                    if (nx, ny) not in visited and not self.map.tiles[ny][nx].is_solid:
+                                        visited.add((nx, ny))
+                                        q.append((nx, ny))
+                        
+                        if target_spot:
+                            c['target'] = target_spot
+                            c['state'] = 'CONSTRUCTING_BED'
+                    
+            if c['state'] == 'CONSTRUCTING_BED':
+                if not c['target']: 
+                    c['state'] = 'IDLE'
+                    continue
+                tx, ty = c['target']
+                if (ix, iy) == (tx, ty):
+                    # Construct
+                    tile = self.map.get_tile(ix, iy)
+                    if tile.char == 'L' and self.map.is_valid_bed_spot(ix, iy): # Double check validity
+                        tile.char = TILES_BED
+                        self.bed_ownership[(ix, iy)] = c['id']
+                    c['state'] = 'IDLE'
+                    c['target'] = None
+                else:
+                    path = self.map.get_path_step(ix, iy, tx, ty)
+                    if path: c['x'], c['y'] = path
+                    else: c['state'] = 'IDLE' # Unreachable
+                continue
 
+            # 3. Training Logic (Go'barr)
+            if c['type'] == 'GOBAR' and c['level'] < 10:
+                # If IDLE or Wandering
+                # If happiness > 0, more likely to train?
+                
+                 if c['state'] == 'IDLE' and random.random() < 0.1:
+                    # Find Training Dummy
+                    q = [(ix, iy)]
+                    visited = set([(ix, iy)])
+                    target_dummy = None
+                    while q:
+                        cx, cy = q.pop(0)
+                        # Check for dummy creature at this location?
+                        # Dummies are creatures now, not tiles.
+                        # Wait, tiles spawners spawn creatures.
+                        # So we look for a creature of type 'DUMMY'
+                        pass 
+                        
+                        # Inefficient to BFS map for creatures. 
+                        # Better: Iterate dummies list.
+                        if len(visited) > 1: break # Skip BFS
+                    
+                    dummies = [d for d in self.creatures if d['type'] == 'DUMMY']
+                    if dummies:
+                        # Pick nearest
+                        nearest = None
+                        min_dist = 9999
+                        for d in dummies:
+                            dist = abs(c['x'] - d['x']) + abs(c['y'] - d['y'])
+                            if dist < min_dist:
+                                min_dist = dist
+                                nearest = d
+                        
+                        if nearest:
+                            c['target'] = (nearest['x'], nearest['y'])
+                            c['state'] = 'TRAINING'
+            
+            if c['state'] == 'TRAINING':
+                 if not c['target']:
+                     c['state'] = 'IDLE'
+                     continue
+                 tx, ty = c['target']
+                 dist = max(abs(ix - tx), abs(iy - ty))
+                 
+                 # Are we INSIDE the training room?
+                 # Actually, logic says "enter the Training Room and then move about inside it."
+                 # Simplify: Walk to dummy, attack it.
+                 
+                 if dist <= 1:
+                     # Attack Dummy
+                     # Gain XP
+                     c['xp'] += 2
+                     self.check_level_up(c)
+                     # Visual?
+                 else:
+                     path = self.map.get_path_step(ix, iy, tx, ty)
+                     if path: c['x'], c['y'] = path
+                     else: c['state'] = 'IDLE'
+                 continue
+
+            # 4. Imp Logic (Worker)
+            if c['type'] == 'IMP':
+                pass # Fallthrough to existing worker logic
+            else:
+                # Go'barr wander if nothing else
+                if c['state'] == 'IDLE':
+                     # Random wander
+                     c['idle_timer'] += 1
+                     if c['idle_timer'] >= 2:
+                        c['idle_timer'] = 0
+                        neighbors = []
+                        for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+                            nx, ny = ix + dx, iy + dy
+                            t = self.map.get_tile(nx, ny)
+                            if t and not t.is_solid:
+                                neighbors.append((nx, ny))
+                        if neighbors:
+                            nx, ny = random.choice(neighbors)
+                            c['x'] = nx
+                            c['y'] = ny
+                continue
+
+            # --- ORIGINAL IMP LOGIC STARTS HERE (Refactored variable 'imp' to 'c') ---
+            imp = c # Alias for minimal code change
+            
             # 1. If currently working (Reinforcing or Mining)
             # Validation of current target
             target_valid = False
@@ -380,7 +708,7 @@ class EntityManager:
                  elif imp['state'] == 'REINFORCING':
                      if t_tile and t_tile.char == TILES_SOFT_ROCK and not t_tile.tagged and t_tile.char != TILES_GOLD: target_valid = True
             
-            if not target_valid and imp['state'] not in ['RETURNING_GOLD', 'IDLE']:
+            if not target_valid and imp['state'] not in ['RETURNING_GOLD', 'IDLE', 'UNCONSCIOUS', 'MOVING_PICKUP', 'MOVING_DIG', 'MOVING_REINFORCE']:
                 imp['target'] = None
                 imp['state'] = 'IDLE'
                 imp['work_timer'] = 0
@@ -427,10 +755,6 @@ class EntityManager:
                     imp['target'] = desired_dropped_gold
                     imp['state'] = 'MOVING_PICKUP'
                     
-                if desired_dropped_gold:
-                    imp['target'] = desired_dropped_gold
-                    imp['state'] = 'MOVING_PICKUP'
-                    
                 else: 
                      # Priority 1: Digging/Mining (Tagged)
                      # Density Limit Check
@@ -438,7 +762,7 @@ class EntityManager:
                      # We must count how many imps target a specific tile.
                      
                      taken_counts = {}
-                     for other in self.imps:
+                     for other in self.creatures:
                          if other['target']:
                              t = other['target']
                              taken_counts[t] = taken_counts.get(t, 0) + 1
@@ -497,7 +821,7 @@ class EntityManager:
                              imp['state'] = 'IDLE' 
                              imp['target'] = None
                              continue # Re-eval next tick
-
+ 
                 
                 tx, ty = imp['target']
                 
@@ -740,6 +1064,55 @@ class EntityManager:
                         imp['x'] = nx
                         imp['y'] = ny
 
+            # Happiness Check
+            if c['happiness'] <= -10 and c['state'] != 'LEAVING':
+                c['state'] = 'LEAVING'
+                c['target'] = self.map.portal_pos
+            
+            if c['state'] == 'LEAVING':
+                px, py = self.map.portal_pos
+                if (c['x'], c['y']) == (px, py):
+                     # Leave
+                    bed_pos = None
+                    for pos, owner_id in self.bed_ownership.items():
+                        if owner_id == c['id']:
+                            bed_pos = pos
+                            break
+                    if bed_pos:
+                        del self.bed_ownership[bed_pos]
+                        tile = self.map.get_tile(*bed_pos)
+                        tile.char = 'L'
+                        
+                    self.creatures.remove(c)
+                    continue
+                else:
+                    path = self.map.get_path_step(c['x'], c['y'], px, py)
+                    if path: c['x'], c['y'] = path
+
+        # Spawn Dummies Check (End of Update)
+        if self.payday_timer % 10 == 0:
+            for y in range(1, self.map.height - 1):
+                for x in range(1, self.map.width - 1):
+                    t = self.map.get_tile(x, y)
+                    if t.char == TILES_TRAINING:
+                        is_center = True
+                        for dy in [-1, 0, 1]:
+                            for dx in [-1, 0, 1]:
+                                if self.map.get_tile(x + dx, y + dy).char != TILES_TRAINING:
+                                    is_center = False
+                                    break
+                            if not is_center: break
+                        
+                        if is_center:
+                            has_dummy = False
+                            for c in self.creatures:
+                                if c['type'] == 'DUMMY' and c['x'] == x and c['y'] == y:
+                                    has_dummy = True
+                                    break
+                            
+                            if not has_dummy:
+                                self.spawn_creature('DUMMY', x, y)
+
 class Renderer:
     def __init__(self, stdscr, game_map):
         self.stdscr = stdscr
@@ -750,19 +1123,25 @@ class Renderer:
 
     def setup_colors(self):
         curses.start_color()
+        if curses.can_change_color():
+             try:
+                 curses.init_color(curses.COLOR_BLACK, 0, 0, 0)
+             except: pass
+
         curses.init_pair(COLOR_ROCK, curses.COLOR_WHITE, curses.COLOR_BLACK)
-        curses.init_pair(COLOR_FLOOR, curses.COLOR_BLACK, curses.COLOR_WHITE) # Inverted for floor look? Or just dim.
-        # Let's try standard colors first
-        curses.init_pair(COLOR_FLOOR, curses.COLOR_CYAN, curses.COLOR_BLACK)
+        curses.init_pair(COLOR_FLOOR, curses.COLOR_BLACK, curses.COLOR_BLACK) 
         curses.init_pair(COLOR_HEART, curses.COLOR_RED, curses.COLOR_BLACK)
         curses.init_pair(COLOR_PORTAL, curses.COLOR_MAGENTA, curses.COLOR_BLACK)
-        curses.init_pair(COLOR_IMP, curses.COLOR_GREEN, curses.COLOR_BLACK)
-        curses.init_pair(COLOR_SELECT, curses.COLOR_BLACK, curses.COLOR_YELLOW)
+        curses.init_pair(COLOR_IMP, curses.COLOR_YELLOW, curses.COLOR_BLACK) 
+        curses.init_pair(COLOR_SELECT, curses.COLOR_WHITE, curses.COLOR_BLUE)
         curses.init_pair(COLOR_GOLD, curses.COLOR_YELLOW, curses.COLOR_BLACK)
-        curses.init_pair(COLOR_REINFORCED, curses.COLOR_WHITE, curses.COLOR_BLACK) 
-        curses.init_pair(COLOR_TREASURY, curses.COLOR_YELLOW, curses.COLOR_BLACK)
-        curses.init_pair(COLOR_MENU, curses.COLOR_BLACK, curses.COLOR_WHITE) # Inverted for menu
-        curses.init_pair(COLOR_SELECT_TEXT, curses.COLOR_YELLOW, curses.COLOR_BLACK) # Yellow text on black for floor highlight
+        curses.init_pair(COLOR_REINFORCED, curses.COLOR_WHITE, curses.COLOR_BLACK)
+        curses.init_pair(COLOR_TREASURY, curses.COLOR_YELLOW, curses.COLOR_BLACK) 
+        curses.init_pair(COLOR_MENU, curses.COLOR_WHITE, curses.COLOR_BLUE)
+        curses.init_pair(COLOR_SELECT_TEXT, curses.COLOR_YELLOW, curses.COLOR_BLUE)
+        curses.init_pair(COLOR_BED, curses.COLOR_CYAN, curses.COLOR_BLACK)
+        curses.init_pair(COLOR_TRAINING, curses.COLOR_BLACK, curses.COLOR_WHITE) 
+        curses.init_pair(COLOR_DUMMY, curses.COLOR_YELLOW, curses.COLOR_BLACK)
 
     def draw(self, paused, imps, selected_room, drag_start=None, drag_end=None, total_gold=0, selected_entity=None):
         # Removed self.stdscr.clear() to reduce flicker. 
@@ -831,6 +1210,8 @@ class Renderer:
                    elif char == TILES_GOLD: pair = COLOR_GOLD
                    elif char == TILES_REINFORCED: pair = COLOR_REINFORCED
                    elif char == TILES_TREASURY: pair = COLOR_TREASURY
+                   elif char == TILES_BED: pair = COLOR_BED
+                   elif char == TILES_TRAINING: pair = COLOR_TRAINING
                    elif char == '=': pair = COLOR_GOLD # Explicit fix for white gold
                    
                    attr = curses.color_pair(pair)
@@ -866,17 +1247,33 @@ class Renderer:
                    except curses.error:
                        pass
         
-        # Draw Imps
-        for imp in imps:
-            scr_x = imp['x'] - self.cam_x
-            scr_y = imp['y'] - self.cam_y
+        # Draw Creatures
+        for c in imps: # Generic alias 'imps' passed from run loop is actually creatures list
+            scr_x = c['x'] - self.cam_x
+            scr_y = c['y'] - self.cam_y
             if 0 <= scr_x < w and 0 <= scr_y < h - 1:
-                # If carrying gold, maybe different color?
-                attr = curses.color_pair(COLOR_IMP) | curses.A_BOLD
-                if imp['gold'] > 0:
+                # Type rendering
+                char = 'i'
+                pair = COLOR_IMP
+                
+                if c['type'] == 'GOBAR':
+                    char = 'g'
+                    pair = COLOR_IMP 
+                elif c['type'] == 'DUMMY':
+                    char = 'O'
+                    pair = COLOR_DUMMY
+
+                attr = curses.color_pair(pair) | curses.A_BOLD
+                if c.get('gold', 0) > 0: # Carry gold visual
                      attr = curses.color_pair(COLOR_GOLD) | curses.A_BOLD
+                
+                # State visuals?
+                if c.get('state') == 'UNCONSCIOUS':
+                    char = 'X' 
+                    attr = curses.color_pair(curses.COLOR_RED) | curses.A_DIM
+                
                 try:
-                    self.stdscr.addch(scr_y, scr_x, TILES_IMP, attr)
+                    self.stdscr.addstr(scr_y, scr_x, char, attr)
                 except curses.error: pass
 
         # Draw UI
@@ -889,6 +1286,12 @@ class Renderer:
             
         # Base info
         base_info = f"| Pos: {self.cam_x},{self.cam_y} | Room: {selected_room} | Gold: {total_gold} "
+        
+        # Payday info?
+        # Accessing renderer via game... need to pass it in?
+        # We can append it if we had access. But draw() arguments.
+        # Let's assume passed in via total_gold or new arg. 
+        # Modifying run() later to pass it? Or just omit for now.
         
         # Priority 2: Inspection (Append at end)
         imp_info = ""
@@ -904,11 +1307,19 @@ class Renderer:
                 'MOVING_PICKUP': "Going to pick up gold",
                 'MOVING_REINFORCE': "Going to reinforce",
                 'REINFORCING': "Reinforcing",
-                'MOVING_DROP': "Dropping gold"
+                'MOVING_DROP': "Dropping gold",
+                'SEEKING_WAGE': "Seeking Wage",
+                'CONSTRUCTING_BED': "Building Bed",
+                'TRAINING': "Training",
+                'UNCONSCIOUS': "Unconscious"
             }
             s_text = state_map.get(ent.get('state'), ent.get('state'))
             
             imp_info = f"| {ent.get('name', '???')} (Lvl {ent.get('level',1)}) - {s_text} "
+            if ent['type'] == 'GOBAR':
+                 imp_info += f"| XP:{ent['xp']} HP:{ent['health']}/{ent['max_health']} DMG:{ent['damage']} Wage:{ent['wage']} Hap:{ent.get('happiness', 0)}"
+            elif ent['type'] == 'IMP':
+                 imp_info += f"| XP:{ent['xp']} HP:{ent['health']}/{ent['max_health']} Hap:{ent.get('happiness', 0)}"
         
         final_status = (status_text + base_info + imp_info).strip()
         
@@ -925,8 +1336,7 @@ class Renderer:
         if paused:
              self.stdscr.border()
 
-        if paused:
-            self.stdscr.border()
+
         
         # NOTE: refresh() removed from here to allow overlay drawing before flip
 
@@ -995,18 +1405,19 @@ class Menu:
         self.game = game
         self.active = False
         self.state = 'MAIN' # MAIN, SAVE, LOAD, CONFIRM_QUIT
-        self.options = ['Resume', 'Save', 'Load', 'Quit']
+        self.options = ['New Game', 'Resume', 'Save', 'Load', 'Quit']
         self.selected = 0
         self.input_text = ""
         self.load_files = []
         self.load_index = 0
+        self.delete_confirm = None # Filename to delete
     
     def draw(self):
         h, w = self.stdscr.getmaxyx()
         
         # Draw Box
         box_w = 40
-        box_h = 14
+        box_h = 16 # Increased height for more options
         start_y = h // 2 - box_h // 2
         start_x = w // 2 - box_w // 2
         
@@ -1031,11 +1442,6 @@ class Menu:
         if self.state == 'MAIN':
             for i, opt in enumerate(self.options):
                 prefix = "> " if i == self.selected else "  "
-                # If selected, maybe invert back to Black on White? Or use Standard?
-                # Actually, standard is White on Black.
-                # If selected: Standard (effectively inverted relative to menu).
-                # If not selected: Menu Attr (Black on White).
-                
                 attr = curses.A_NORMAL if i == self.selected else menu_attr
                 self.stdscr.addstr(start_y + 2 + i * 2, start_x + 4, prefix + opt, attr)
                 
@@ -1046,9 +1452,17 @@ class Menu:
             self.stdscr.addstr(start_y + 11, start_x + 2, "Esc to Cancel", menu_attr)
             
         elif self.state == 'LOAD':
+            if self.delete_confirm:
+                self.stdscr.addstr(start_y + 2, start_x + 2, "DELETE this save?", menu_attr)
+                self.stdscr.addstr(start_y + 3, start_x + 2, self.delete_confirm, menu_attr)
+                self.stdscr.addstr(start_y + 5, start_x + 2, "> Yes (Enter)", menu_attr)
+                self.stdscr.addstr(start_y + 6, start_x + 2, "  No (Esc)", menu_attr)
+                return
+
             if not self.load_files:
                 self.stdscr.addstr(start_y + 2, start_x + 2, "No Saves Found", menu_attr)
             else:
+                self.stdscr.addstr(start_y + 1, start_x + 25, "(D)elete", menu_attr) 
                 for i in range(min(5, len(self.load_files))):
                     idx = self.load_index + i 
                     if idx < len(self.load_files):
@@ -1057,7 +1471,7 @@ class Menu:
                          self.stdscr.addstr(start_y + 2 + i, start_x + 2, prefix + self.load_files[idx], attr)
         
         elif self.state == 'CONFIRM_QUIT':
-             self.stdscr.addstr(start_y + 2, start_x + 2, "Are you sure?", menu_attr)
+             self.stdscr.addstr(start_y + 2, start_x + 2, "Exit ASCIIper?", menu_attr)
              opts = ["Yes", "Cancel"]
              for i, opt in enumerate(opts):
                  prefix = "> " if i == self.selected else "  "
@@ -1072,31 +1486,25 @@ class Menu:
                     # Check overlap with Menu Box
                     h, w = self.stdscr.getmaxyx()
                     box_w = 40
-                    box_h = 14
+                    box_h = 16
                     start_y = h // 2 - box_h // 2
                     start_x = w // 2 - box_w // 2
                     
                     # Clicks inside box
                     if start_x <= x < start_x + box_w and start_y <= y < start_y + box_h:
-                        # Map Y to Options
-                        # Main Options start at start_y + 2, spacing 2
                         if self.state == 'MAIN':
                             rel_y = y - (start_y + 2)
                             if rel_y >= 0 and rel_y % 2 == 0:
                                 idx = rel_y // 2
                                 if 0 <= idx < len(self.options):
                                     self.selected = idx
-                                    # Trigger Enter logic immediately on click? Or just select?
-                                    # User said "clicking Yes", implying action.
-                                    # Let's trigger Enter logic.
                                     key = 10 # Emulate Enter
                         
                         elif self.state == 'CONFIRM_QUIT':
-                            # Options start at start_y + 5, spacing 1
                             rel_y = y - (start_y + 5)
                             if rel_y >= 0:
                                 idx = rel_y
-                                if 0 <= idx < 2: # Yes, Cancel
+                                if 0 <= idx < 2:
                                     self.selected = idx
                                     key = 10
             except:
@@ -1105,6 +1513,8 @@ class Menu:
         if key == 27: # Esc
             if self.state == 'MAIN':
                 self.active = False
+            elif self.state == 'LOAD' and self.delete_confirm:
+                self.delete_confirm = None
             else:
                 self.state = 'MAIN'
             return
@@ -1116,7 +1526,11 @@ class Menu:
                 self.selected = min(len(self.options) - 1, self.selected + 1)
             elif key == 10: # Enter
                 opt = self.options[self.selected]
-                if opt == 'Resume': self.active = False
+                if opt == 'New Game':
+                     # Reset Game
+                     self.game.__init__(self.stdscr) # Re-init everything
+                     self.active = False
+                elif opt == 'Resume': self.active = False
                 elif opt == 'Save': 
                     self.state = 'SAVE'
                     self.input_text = ""
@@ -1128,7 +1542,6 @@ class Menu:
                     self.state = 'CONFIRM_QUIT'
                     self.selected = 0 # Default Yes (Index 0)
                     
-
         elif self.state == 'SAVE':
             if key == 10: # Enter
                 if self.input_text:
@@ -1142,6 +1555,17 @@ class Menu:
                     self.input_text += chr(key)
                     
         elif self.state == 'LOAD':
+            if self.delete_confirm:
+                if key == 10:
+                     # Do delete
+                     path = os.path.join(SaveManager.get_save_dir(), self.delete_confirm)
+                     if os.path.exists(path):
+                         os.remove(path)
+                     self.load_files = SaveManager.list_saves()
+                     self.delete_confirm = None
+                     self.selected = 0
+                return
+
             if not self.load_files: return
             if key == curses.KEY_UP:
                 self.selected = max(0, self.selected - 1)
@@ -1152,6 +1576,9 @@ class Menu:
                 if SaveManager.load_game(self.game, filename):
                     self.active = False
                     self.state = 'MAIN'
+            elif key == ord('d') or key == ord('D'):
+                if self.load_files:
+                    self.delete_confirm = self.load_files[self.selected]
                     
         elif self.state == 'CONFIRM_QUIT':
              if key == curses.KEY_UP or key == curses.KEY_DOWN:
@@ -1238,8 +1665,12 @@ class Game:
                             char_to_apply = 'L'
                         elif self.selected_room == "Treasury":
                             char_to_apply = TILES_TREASURY
+                        elif self.selected_room == "Training Room":
+                            char_to_apply = TILES_TRAINING
                         
                         # Drop logic for costs
+                        # Update Costs
+                        if self.selected_room == "Training Room": cost_per_tile = 150 # Expensive?
                         if char_to_apply and cost_per_tile > 0:
                             # Try to pay
                             paid = False
@@ -1345,6 +1776,17 @@ class Game:
                 self.menu.state = 'MAIN'
                 self.paused = True
                 continue
+            
+            # Unpause if menu just closed (Logic handled in Menu, but we need to sync)
+            if not self.menu.active and self.paused:
+                # If we were paused by menu, unpause. 
+                # But manual pause (Space) exists.
+                # User req: "Game should unpause when you close the menu."
+                # We can enforce this by checking if menu WAS active?
+                # Simplify: If menu inactive, we can force unpause if it was the menu that paused it?
+                # The user just said "unpause when close menu".
+                # Let's say we unpause.
+                self.paused = False
 
             if key == KEY_QUIT:
                 # Replaced by Menu Quit? 
@@ -1367,6 +1809,11 @@ class Game:
                 self.selected_room = "Lair"
             elif key == ord('4'):
                 self.selected_room = "Treasury"
+            elif key == ord('5'):
+                self.selected_room = "Bed" # Logic maps "Bed" to TILES_BED? No, drag logic maps rooms. 
+                # Need to update handle_drag_action for "Bed" and "Training Room"
+            elif key == ord('6'):
+                self.selected_room = "Training Room"
             elif key == curses.KEY_UP or key == ord('w'):
                 self.renderer.cam_y -= 1
             elif key == curses.KEY_DOWN or key == ord('s'):
@@ -1460,7 +1907,11 @@ class Game:
             d_start = self.drag_start if not self.menu.active else None
             d_end = self.drag_end if not self.menu.active else None
             
-            self.renderer.draw(self.paused, self.entities.imps, self.selected_room, 
+            # Pass Payday? 
+            # We didn't change draw signature for Payday timer yet.. 
+            # Just relying on status update?
+            # Revisit: We updated draw to handle 'imps' argument as generic 'creatures'.
+            self.renderer.draw(self.paused, self.entities.creatures, self.selected_room, 
                                d_start, d_end, self.entities.total_gold, self.selected_entity)
             
             if self.menu.active:
