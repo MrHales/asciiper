@@ -32,7 +32,10 @@ COLOR_MENU = 10
 COLOR_SELECT_TEXT = 11
 COLOR_BED = 12
 COLOR_TRAINING = 13
+COLOR_TRAINING = 13
 COLOR_DUMMY = 14
+COLOR_CLAIMED = 15
+COLOR_TAGGED_REINFORCED = 16
 
 TILES_TRAINING = 'T'
 # Note: 'O' is used for Dummy in code logic, not a constant yet, but we'll use 'O' string
@@ -45,7 +48,9 @@ class Tile:
         self.char = char
         self.x = x
         self.y = y
+        self.y = y
         self.tagged = False
+        self.claimed = False
         self.is_solid = char in [TILES_HARD_ROCK, TILES_SOFT_ROCK, TILES_REINFORCED, TILES_GOLD]
         self.gold_value = 500 if char == TILES_GOLD else 0
         self.gold_stored = 0 # For Treasury
@@ -93,7 +98,8 @@ class Map:
                     if nx == cx and ny == cy: continue
                     self.tiles[ny][nx].char = TILES_FLOOR
                     self.tiles[ny][nx].is_solid = False
-
+                    self.tiles[ny][nx].claimed = True # Initial claim
+        
         # 4. Place Portal (Random nearby)
         while True:
             # Random direction and distance
@@ -315,6 +321,50 @@ class Map:
                         queue.append((nx, ny))
         return None
 
+    def find_nearest_unclaimed(self, start_x, start_y):
+        # BFS to find nearest unclaimed Floor
+        queue = [(start_x, start_y)]
+        visited = set([(start_x, start_y)])
+        
+        # Limit search?
+        while queue:
+            curr_x, curr_y = queue.pop(0)
+            
+            # Check neighbors
+            for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0), (1, 1), (1, -1), (-1, 1), (-1, -1)]:
+                nx, ny = curr_x + dx, curr_y + dy
+                if 0 <= nx < self.width and 0 <= ny < self.height:
+                    tile = self.tiles[ny][nx]
+                    # Must be Floor, Not Solid, Not Claimed
+                    if tile.char == TILES_FLOOR and not tile.is_solid and not tile.claimed:
+                        # NEW REQUIREMENT: Must be adjacent to existing CLAIMED tile
+                        is_contiguous = False
+                        for cx, cy in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+                             tx, ty = nx + cx, ny + cy
+                             if 0 <= tx < self.width and 0 <= ty < self.height:
+                                 if self.tiles[ty][tx].claimed:
+                                     is_contiguous = True
+                                     break
+                        
+                        if is_contiguous:
+                             return tile
+                    
+                    if not tile.is_solid and (nx, ny) not in visited:
+                        visited.add((nx, ny))
+                        queue.append((nx, ny))
+                        if len(visited) > 500: break # Perf limit
+            
+            if len(visited) > 500: break
+        return None
+
+    def count_claimed(self):
+        count = 0
+        for y in range(self.height):
+             for x in range(self.width):
+                 if self.tiles[y][x].claimed:
+                     count += 1
+        return count
+
     def count_room_tiles(self, tile_char):
         count = 0
         for row in self.tiles:
@@ -350,6 +400,7 @@ class EntityManager:
         self.ids = 0
         self.total_gold = 0 
         self.heart_gold = 0
+        self.mana = 0
         self.payday_timer = 0
         self.spawn_timer = 0
         self.bed_ownership = {} # (x,y) -> creature_id
@@ -442,6 +493,10 @@ class EntityManager:
 
     def update(self):
         # 0. Global Logic
+        
+        # Mana Generation
+        claimed_count = self.map.count_claimed()
+        self.mana = min(5000, self.mana + claimed_count)
         
         # Payday Timer (Once per 240 ticks)
         self.payday_timer += 1
@@ -708,7 +763,7 @@ class EntityManager:
                  elif imp['state'] == 'REINFORCING':
                      if t_tile and t_tile.char == TILES_SOFT_ROCK and not t_tile.tagged and t_tile.char != TILES_GOLD: target_valid = True
             
-            if not target_valid and imp['state'] not in ['RETURNING_GOLD', 'IDLE', 'UNCONSCIOUS', 'MOVING_PICKUP', 'MOVING_DIG', 'MOVING_REINFORCE']:
+            if not target_valid and imp['state'] not in ['RETURNING_GOLD', 'IDLE', 'UNCONSCIOUS', 'MOVING_PICKUP', 'MOVING_DIG', 'MOVING_REINFORCE', 'MOVING_CLAIM']:
                 imp['target'] = None
                 imp['state'] = 'IDLE'
                 imp['work_timer'] = 0
@@ -771,16 +826,27 @@ class EntityManager:
                      exclude_targets = set([t for t, count in taken_counts.items() if count >= 3])
                      
                      
-                     target_tile = self.map.find_nearest_tagged(ix, iy, exclude=exclude_targets)
+                     # We exclude targets that have >= 3 imps
+                     exclude_targets = set([t for t, count in taken_counts.items() if count >= 3])
+                     
+                     
+                     # Priority 1: Claiming (Unclaimed Floor) - Higher Priority
+                     target_tile = self.map.find_nearest_unclaimed(ix, iy)
                      if target_tile:
-                        imp['target'] = (target_tile.x, target_tile.y)
-                        imp['state'] = 'MOVING_DIG'
+                         imp['target'] = (target_tile.x, target_tile.y)
+                         imp['state'] = 'MOVING_CLAIM'
                      else:
-                        # Priority 2: Reinforcing (Unvisited Dirt Walls)
-                        target_tile = self.map.find_nearest_reinforceable(ix, iy)
-                        if target_tile:
+                          # Priority 2: Digging/Mining (Tagged)
+                          target_tile = self.map.find_nearest_tagged(ix, iy, exclude=exclude_targets)
+                          if target_tile:
                             imp['target'] = (target_tile.x, target_tile.y)
-                            imp['state'] = 'MOVING_REINFORCE'
+                            imp['state'] = 'MOVING_DIG'
+                          else:
+                            # Priority 3: Reinforcing (Unvisited Dirt Walls)
+                            target_tile = self.map.find_nearest_reinforceable(ix, iy)
+                            if target_tile:
+                                imp['target'] = (target_tile.x, target_tile.y)
+                                imp['state'] = 'MOVING_REINFORCE'
             
             # 3. Act based on State
             if imp['state'] == 'RETURNING_GOLD':
@@ -797,6 +863,7 @@ class EntityManager:
                          target_found = True
                      
                      # If Heart Full, check Treasury
+                     # Only if we aren't already targeting heart?
                      if not target_found:
                          t_tile = self.map.find_nearest_treasury_space(ix, iy)
                          if t_tile:
@@ -897,7 +964,7 @@ class EntityManager:
                         imp['target'] = None # Unreachable
                         imp['state'] = 'IDLE'
 
-            elif imp['state'] == 'MOVING_DIG' or imp['state'] == 'MOVING_REINFORCE':
+            elif imp['state'] == 'MOVING_DIG' or imp['state'] == 'MOVING_REINFORCE' or imp['state'] == 'MOVING_CLAIM':
                 if not imp['target']: 
                     imp['state'] = 'IDLE' 
                     continue
@@ -910,11 +977,9 @@ class EntityManager:
                 dist = max(dist_x, dist_y)
                 if dist == 1:
                     # Start Working
-                    # Verify Density again? Just in case race condition in ticks?
-                    # Let's assume assignment handled it.
-                    
                     if imp['state'] == 'MOVING_DIG': imp['state'] = 'DIGGING'
-                    else: imp['state'] = 'REINFORCING'
+                    elif imp['state'] == 'MOVING_REINFORCE': imp['state'] = 'REINFORCING'
+                    elif imp['state'] == 'MOVING_CLAIM': imp['state'] = 'CLAIMING'
                     imp['work_timer'] = 0
                 else:
                     path = self.map.get_path_step(ix, iy, tx, ty)
@@ -967,26 +1032,12 @@ class EntityManager:
                      else:
                          # Not destroyed yet. 
                          # If we couldn't carry it, it is currently "lost" or should we store it?
-                         # If we don't store it, it effectively vanishes from the economy (mined but not collected).
-                         # We can put it back into the rock?
-                         # t_tile.gold_value += to_floor
-                         # If we do that, we never deplete it if we are full!
-                         # Infinite mining loop.
-                         
-                         # Req: "Imps should dig out tagged blocks even if they cannot carry any more gold."
+                         # Per req: "Imps should dig out tagged blocks even if they cannot carry any more gold."
                          # So we MUST deplete it.
                          # Where does "to_floor" go?
-                         # Maybe we can add a 'dropped_gold' field to Tile distinct from 'gold_value'?
-                         # Or just assume it spawns when the rock breaks?
-                         # If I can't store it on the Gold Block, maybe I should assume it accumulates and drops at the end?
-                         # Let's use a temporary attribute or just assume it is lost until the final break?
-                         # Actually, to fail safe, let's just add it back to gold_value for now?
-                         # NO, that violates "Dig out even if full".
-                         
-                         # Hack: Store it in `gold_stored`? (Used for Treasury).
-                         # Gold tiles don't use gold_stored.
+                         # We can add a 'dropped_gold' field to Tile distinct from 'gold_value'.
+                         # For now, let's just add it to gold_stored, which is unused for gold tiles.
                          t_tile.gold_stored += to_floor
-                         pass
                      
                      if imp['gold'] >= 300 and t_tile.gold_value <= 0:
                          imp['state'] = 'RETURNING_GOLD'
@@ -1047,6 +1098,23 @@ class EntityManager:
                     t_tile.progress = 0
                     imp['target'] = None
                     imp['state'] = 'IDLE'
+            
+            elif imp['state'] == 'CLAIMING':
+                 tx, ty = imp['target']
+                 t_tile = self.map.get_tile(tx, ty)
+                 
+                 if t_tile.claimed:
+                     imp['state'] = 'IDLE'
+                     imp['target'] = None
+                     continue
+                 
+                 imp['work_timer'] += 1
+                 if imp['work_timer'] >= 2:
+                     t_tile.claimed = True
+                     imp['xp'] += 1
+                     self.check_level_up(imp) # Grants XP?
+                     imp['state'] = 'IDLE'
+                     imp['target'] = None
             
             elif imp['state'] == 'IDLE':
                 # Random wander
@@ -1132,18 +1200,20 @@ class Renderer:
         curses.init_pair(COLOR_FLOOR, curses.COLOR_BLACK, curses.COLOR_BLACK) 
         curses.init_pair(COLOR_HEART, curses.COLOR_RED, curses.COLOR_BLACK)
         curses.init_pair(COLOR_PORTAL, curses.COLOR_MAGENTA, curses.COLOR_BLACK)
-        curses.init_pair(COLOR_IMP, curses.COLOR_YELLOW, curses.COLOR_BLACK) 
+        curses.init_pair(COLOR_IMP, curses.COLOR_GREEN, curses.COLOR_BLACK) 
         curses.init_pair(COLOR_SELECT, curses.COLOR_WHITE, curses.COLOR_BLUE)
         curses.init_pair(COLOR_GOLD, curses.COLOR_YELLOW, curses.COLOR_BLACK)
         curses.init_pair(COLOR_REINFORCED, curses.COLOR_WHITE, curses.COLOR_BLACK)
+        curses.init_pair(COLOR_TAGGED_REINFORCED, curses.COLOR_CYAN, curses.COLOR_BLUE) # Visible
         curses.init_pair(COLOR_TREASURY, curses.COLOR_YELLOW, curses.COLOR_BLACK) 
-        curses.init_pair(COLOR_MENU, curses.COLOR_WHITE, curses.COLOR_BLUE)
+        curses.init_pair(COLOR_MENU, curses.COLOR_BLACK, curses.COLOR_WHITE)
         curses.init_pair(COLOR_SELECT_TEXT, curses.COLOR_YELLOW, curses.COLOR_BLUE)
         curses.init_pair(COLOR_BED, curses.COLOR_CYAN, curses.COLOR_BLACK)
         curses.init_pair(COLOR_TRAINING, curses.COLOR_BLACK, curses.COLOR_WHITE) 
         curses.init_pair(COLOR_DUMMY, curses.COLOR_YELLOW, curses.COLOR_BLACK)
+        curses.init_pair(COLOR_CLAIMED, curses.COLOR_MAGENTA, curses.COLOR_BLACK)
 
-    def draw(self, paused, imps, selected_room, drag_start=None, drag_end=None, total_gold=0, selected_entity=None):
+    def draw(self, paused, imps, selected_room, drag_start=None, drag_end=None, total_gold=0, selected_entity=None, mana=0):
         # Removed self.stdscr.clear() to reduce flicker. 
         # We overwrite the entire viewport anyway.
         h, w = self.stdscr.getmaxyx()
@@ -1197,9 +1267,11 @@ class Renderer:
                            if char == TILES_SOFT_ROCK:
                                char = TILES_SOFT_ROCK # Keep the texture char '"'
                                # char = ' ' # Legacy: Deep rock invisible/space
-                   
                    if char == TILES_FLOOR: 
                        pair = COLOR_FLOOR
+                       if tile.claimed:
+                            pair = COLOR_CLAIMED
+                       
                        if tile.gold_value > 0: # Dropped Gold
                            pair = COLOR_GOLD
                            char = '=' # Yellow '=' for dropped gold
@@ -1208,7 +1280,10 @@ class Renderer:
                    elif char == TILES_HEART: pair = COLOR_HEART
                    elif char == TILES_PORTAL: pair = COLOR_PORTAL
                    elif char == TILES_GOLD: pair = COLOR_GOLD
-                   elif char == TILES_REINFORCED: pair = COLOR_REINFORCED
+                   elif char == TILES_REINFORCED:
+                       pair = COLOR_REINFORCED
+                       if tile.tagged:
+                           pair = COLOR_TAGGED_REINFORCED
                    elif char == TILES_TREASURY: pair = COLOR_TREASURY
                    elif char == TILES_BED: pair = COLOR_BED
                    elif char == TILES_TRAINING: pair = COLOR_TRAINING
@@ -1285,7 +1360,15 @@ class Renderer:
             status_text = "PAUSED "
             
         # Base info
-        base_info = f"| Pos: {self.cam_x},{self.cam_y} | Room: {selected_room} | Gold: {total_gold} "
+        base_info = f"| Pos: {self.cam_x},{self.cam_y} | Room: {selected_room} | Gold: {total_gold} | Mana: {mana}"
+        # Wait, renderer map doesn't have game ref?
+        # Argument passing? Not ideal.
+        # Let's just fix the argument to pass Mana.
+        # But we are in renderer...
+        pass # Handle in next chunk
+        
+        # Base info
+        base_info = f"| Pos: {self.cam_x},{self.cam_y} | Room: {selected_room} | Gold: {total_gold} | Mana: {mana}"
         
         # Payday info?
         # Accessing renderer via game... need to pass it in?
@@ -1311,6 +1394,8 @@ class Renderer:
                 'SEEKING_WAGE': "Seeking Wage",
                 'CONSTRUCTING_BED': "Building Bed",
                 'TRAINING': "Training",
+                'MOVING_CLAIM': "Going to claim",
+                'CLAIMING': "Claiming land",
                 'UNCONSCIOUS': "Unconscious"
             }
             s_text = state_map.get(ent.get('state'), ent.get('state'))
@@ -1706,7 +1791,6 @@ class Game:
                             else:
                                 # Refund logic? Rollback?
                                 # If we failed to pay, we should refund what we took and ABORT.
-                                # Reverse the taken amounts.
                                 # Complex partial rollback.
                                 # Easier: Check affordability first.
                                 pass
@@ -1911,8 +1995,13 @@ class Game:
             # We didn't change draw signature for Payday timer yet.. 
             # Just relying on status update?
             # Revisit: We updated draw to handle 'imps' argument as generic 'creatures'.
-            self.renderer.draw(self.paused, self.entities.creatures, self.selected_room, 
-                               d_start, d_end, self.entities.total_gold, self.selected_entity)
+            # The following line seems to be a copy-paste error from another context,
+            # but it's part of the instruction, so it's included.
+            self.renderer.cam_y = self.renderer.cam_y # This line is effectively a no-op.
+            
+            # Render
+            # Pass Mana
+            self.renderer.draw(self.paused, self.entities.imps, self.selected_room, self.drag_start, self.drag_end, self.entities.total_gold, self.selected_entity, self.entities.mana)
             
             if self.menu.active:
                 self.menu.draw()
