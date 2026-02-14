@@ -1550,18 +1550,40 @@ class SaveManager:
         files = [f for f in os.listdir(d) if f.endswith('.save')]
         return files
 
+    @staticmethod
+    def get_latest_save():
+        d = SaveManager.get_save_dir()
+        files = SaveManager.list_saves()
+        if not files: return None
+        
+        # Sort by mtime
+        files.sort(key=lambda f: os.path.getmtime(os.path.join(d, f)), reverse=True)
+        return files[0]
+
 class Menu:
     def __init__(self, stdscr, game):
         self.stdscr = stdscr
         self.game = game
         self.active = False
         self.state = 'MAIN' # MAIN, SAVE, LOAD, CONFIRM_QUIT
-        self.options = ['New Game', 'Resume', 'Save', 'Load', 'Quit']
+        self.options = [] # Dynamic
         self.selected = 0
         self.input_text = ""
         self.load_files = []
         self.load_index = 0
         self.delete_confirm = None # Filename to delete
+        
+        self.update_options() # Init options
+
+    def update_options(self):
+        if self.game.game_started:
+            self.options = ['Resume', 'Save', 'Load', 'Quit']
+        else:
+            self.options = ['New Game', 'Continue', 'Load', 'Quit']
+        
+        # Clamp selection just in case
+        if self.selected >= len(self.options):
+            self.selected = 0
     
     def draw(self):
         h, w = self.stdscr.getmaxyx()
@@ -1679,9 +1701,23 @@ class Menu:
                 opt = self.options[self.selected]
                 if opt == 'New Game':
                      # Reset Game
-                     self.game.__init__(self.stdscr) # Re-init everything
-                     self.active = False
-                elif opt == 'Resume': self.active = False
+                     self.game.__init__(self.stdscr, start_in_menu=False) # Re-init everything
+                     # self.active = False # Handled in init? No Init makes active False? 
+                     # Wait, Game.__init__ sets active=False if start_in_menu=False?
+                     # Let's check Game.__init__ below
+                elif opt == 'Continue':
+                     latest = SaveManager.get_latest_save()
+                     if latest:
+                         if SaveManager.load_game(self.game, latest):
+                             self.game.game_started = True
+                             self.game.paused = False
+                             self.active = False
+                     else:
+                         # Flash error or just nothing?
+                         pass
+                elif opt == 'Resume': 
+                    self.active = False
+                    self.game.paused = False
                 elif opt == 'Save': 
                     self.state = 'SAVE'
                     self.input_text = ""
@@ -1730,7 +1766,7 @@ class Menu:
             elif key == ord('d') or key == ord('D'):
                 if self.load_files:
                     self.delete_confirm = self.load_files[self.selected]
-                    
+    
         elif self.state == 'CONFIRM_QUIT':
              if key == curses.KEY_UP or key == curses.KEY_DOWN:
                  self.selected = 1 - self.selected
@@ -1739,12 +1775,14 @@ class Menu:
                      self.game.running = False
                  else:
                      self.state = 'MAIN'
+                     self.update_options()
 
 class Game:
-    def __init__(self, stdscr):
+    def __init__(self, stdscr, start_in_menu=True):
         self.stdscr = stdscr
         self.running = True
         self.paused = False
+        self.game_started = False
         self.selected_room = "None"
         self.selected_entity = None
         
@@ -1773,7 +1811,20 @@ class Game:
         self.renderer.cam_x = max(0, self.map.width // 2 - 40)
         self.renderer.cam_y = max(0, self.map.height // 2 - 15)
         
+        self.renderer.cam_y = max(0, self.map.height // 2 - 15)
+        
         self.menu = Menu(stdscr, self)
+        
+        if start_in_menu:
+            self.game_started = False
+            self.paused = True
+            self.menu.active = True
+            self.menu.state = 'MAIN'
+            self.menu.update_options()
+        else:
+            self.game_started = True
+            self.paused = False
+            self.menu.active = False
 
     def handle_drag_action(self, x1, y1, x2, y2):
         min_x, max_x = min(x1, x2), max(x1, x2)
@@ -1926,6 +1977,7 @@ class Game:
             if key == 27: # Esc
                 self.menu.active = True
                 self.menu.state = 'MAIN'
+                self.menu.update_options()
                 self.paused = True
                 continue
             
@@ -2081,7 +2133,7 @@ class Game:
             curses.napms(16)
 
 def main(stdscr):
-    game = Game(stdscr)
+    game = Game(stdscr, start_in_menu=True)
     game.run()
 
 if __name__ == "__main__":
