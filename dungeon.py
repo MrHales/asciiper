@@ -55,6 +55,7 @@ class Tile:
         self.gold_value = 500 if char == TILES_GOLD else 0
         self.gold_stored = 0 # For Treasury
         self.progress = 0 # For digging/reinforcing steps. Max varying.
+        self.timestamp = 0 # For job priority
 
 class Map:
     def __init__(self, width, height):
@@ -321,7 +322,42 @@ class Map:
                         queue.append((nx, ny))
         return None
 
-    def find_nearest_unclaimed(self, start_x, start_y):
+    def find_priority_job(self, start_x, start_y, exclude=set()):
+        # Find best job: Oldest Timestamp > Gold > Distance
+        candidates = []
+        
+        # Optimize iteration? Tagged list?
+        # For now, scan all.
+        for y in range(self.height):
+            for x in range(self.width):
+                t = self.tiles[y][x]
+                if t.tagged and t.is_solid and (x, y) not in exclude:
+                     # Check exposed
+                     if self.is_exposed(x, y):
+                         candidates.append(t)
+        
+        if not candidates: return None
+        
+        # Sort
+        # 1. Timestamp (Ascending)
+        # 2. Is Gold? (Yes=0, No=1) - So we sort by negation of "is gold" if we want Gold first? 
+        # Actually prompt says: "prioritize digging gold over dirt if the gold and dirt have the SAME timestamp"
+        # So secondary key is Type.
+        # But timestamps are floats, unlikely to be exactly equal.
+        # "roughly same timestamp" -> Drag action sets exact same time for batch.
+        # So exact equality works for drag batches.
+        
+        # 3. Distance
+        
+        def priority_key(t):
+            dist = max(abs(t.x - start_x), abs(t.y - start_y))
+            is_gold = 0 if t.char == TILES_GOLD else 1
+            return (t.timestamp, is_gold, dist)
+            
+        candidates.sort(key=priority_key)
+        return candidates[0]
+
+    def find_nearest_unclaimed(self, start_x, start_y, exclude=set()):
         # BFS to find nearest unclaimed Floor
         queue = [(start_x, start_y)]
         visited = set([(start_x, start_y)])
@@ -349,7 +385,7 @@ class Map:
                         if is_contiguous:
                              return tile
                     
-                    if not tile.is_solid and (nx, ny) not in visited:
+                    if not tile.is_solid and (nx, ny) not in visited and (nx, ny) not in exclude:
                         visited.add((nx, ny))
                         queue.append((nx, ny))
                         if len(visited) > 500: break # Perf limit
@@ -413,9 +449,9 @@ class EntityManager:
     def spawn_creature(self, c_type, x, y):
         # Added tick_offset to randomize updates or idle timing
         names_imp = ["Op", "Baz", "Fo", "Zot", "Taw", "Bip", "Mog", "Gub"]
-        names_gobar = ["Grom", "Throk", "Varg", "Krug", "Drak", "Murn", "Zog", "Ruk"]
+        names_gobarr = ["Grom", "Throk", "Varg", "Krug", "Drak", "Murn", "Zog", "Ruk"]
         
-        name = random.choice(names_imp) if c_type == 'IMP' else random.choice(names_gobar)
+        name = random.choice(names_imp) if c_type == 'IMP' else random.choice(names_gobarr)
         
         # Base stats
         c = {
@@ -444,7 +480,7 @@ class EntityManager:
             c['health'] = 50
             c['damage'] = 5
             c['wage'] = 0 # Imps don't get paid
-        elif c_type == 'GOBAR':
+        elif c_type == 'GOBARR':
             c['max_health'] = 150
             c['health'] = 150
             c['damage'] = 30
@@ -486,7 +522,7 @@ class EntityManager:
                  c['max_health'] += int(c['max_health'] * 0.1)
                  c['health'] = c['max_health']
                  c['damage'] += int(c['damage'] * 0.1)
-                 if c['type'] == 'GOBAR':
+                 if c['type'] == 'GOBARR':
                      c['wage'] += 1
              else:
                  break
@@ -512,12 +548,12 @@ class EntityManager:
                     # For now just reset status logic.
 
         # Spawn Go'barr Check
-        # Lair >= 10, Treasury >= 10, Portal exists. max 10 gobars.
-        gobars = [c for c in self.creatures if c['type'] == 'GOBAR']
+        # Lair >= 10, Treasury >= 10, Portal exists. max 10 gobarrs.
+        gobarrs = [c for c in self.creatures if c['type'] == 'GOBARR']
         
         self.spawn_timer -= 1
         
-        if len(gobars) < 10 and self.spawn_timer <= 0:
+        if len(gobarrs) < 10 and self.spawn_timer <= 0:
              # Check Conditions
              lair_size = self.map.count_room_tiles('L')
              treasury_size = self.map.count_room_tiles(TILES_TREASURY)
@@ -536,7 +572,7 @@ class EntityManager:
                  
                  if has_space:
                       px, py = self.map.portal_pos
-                      self.spawn_creature('GOBAR', px, py)
+                      self.spawn_creature('GOBARR', px, py)
                       self.spawn_timer = random.randint(30, 60)
 
         # Logic update for creatures (1 tick per sec)
@@ -602,7 +638,7 @@ class EntityManager:
                  continue
             
             # 2. Go'barr Specific: Bed Construction
-            if c['type'] == 'GOBAR' and c['state'] == 'IDLE':
+            if c['type'] == 'GOBARR' and c['state'] == 'IDLE':
                 # Check if I own a bed
                 my_bed_pos = None
                 for pos, owner_id in self.bed_ownership.items():
@@ -666,7 +702,7 @@ class EntityManager:
                 continue
 
             # 3. Training Logic (Go'barr)
-            if c['type'] == 'GOBAR' and c['level'] < 10:
+            if c['type'] == 'GOBARR' and c['level'] < 10:
                 # If IDLE or Wandering
                 # If happiness > 0, more likely to train?
                 
@@ -762,6 +798,9 @@ class EntityManager:
                  # If Reinforcing: Soft Rock?
                  elif imp['state'] == 'REINFORCING':
                      if t_tile and t_tile.char == TILES_SOFT_ROCK and not t_tile.tagged and t_tile.char != TILES_GOLD: target_valid = True
+                 # If Claiming: Not Claimed?
+                 elif imp['state'] == 'CLAIMING':
+                     if t_tile and not t_tile.claimed and not t_tile.is_solid: target_valid = True
             
             if not target_valid and imp['state'] not in ['RETURNING_GOLD', 'IDLE', 'UNCONSCIOUS', 'MOVING_PICKUP', 'MOVING_DIG', 'MOVING_REINFORCE', 'MOVING_CLAIM']:
                 imp['target'] = None
@@ -826,27 +865,42 @@ class EntityManager:
                      exclude_targets = set([t for t, count in taken_counts.items() if count >= 3])
                      
                      
-                     # We exclude targets that have >= 3 imps
-                     exclude_targets = set([t for t, count in taken_counts.items() if count >= 3])
                      
+                     # Check Priority 1: Digging/Reinforcing based on Job Priority
+                     # This unifies Digging and Reinforcing into "Work" if Reinforce was tagged?
+                     # But Reinforce is separate logic in original code (untagged).
+                     # "Priorities: Digging over Claiming"
                      
-                     # Priority 1: Claiming (Unclaimed Floor) - Higher Priority
-                     target_tile = self.map.find_nearest_unclaimed(ix, iy)
+                     # Digging is Tagged. Reinforcing is untagged auto-work.
+                     # We prioritize Tagged jobs (Digging) first?
+                     # The prompt implies job queue.
+                     
+                     target_tile = self.map.find_priority_job(ix, iy, exclude=exclude_targets)
                      if target_tile:
                          imp['target'] = (target_tile.x, target_tile.y)
-                         imp['state'] = 'MOVING_CLAIM'
+                         # Determine state based on tile
+                         # Tagged tiles are usually Digging (or Mining if gold)
+                         # Reset stats
+                         imp['state'] = 'MOVING_DIG' # Logic handles gold/rock in DIGGING state
                      else:
-                          # Priority 2: Digging/Mining (Tagged)
-                          target_tile = self.map.find_nearest_tagged(ix, iy, exclude=exclude_targets)
+                          # Priority 2: Claiming (Unclaimed Floor) - Lower Priority
+                          # Divide and Conquer: Exclude unclaimed tiles already targeted by others for claiming
+                          claim_targets = set()
+                          for other in self.creatures:
+                              if other['target'] and other['state'] in ['MOVING_CLAIM', 'CLAIMING']:
+                                  claim_targets.add(other['target'])
+                          
+                          target_tile = self.map.find_nearest_unclaimed(ix, iy, exclude=claim_targets)
                           if target_tile:
-                            imp['target'] = (target_tile.x, target_tile.y)
-                            imp['state'] = 'MOVING_DIG'
+                              imp['target'] = (target_tile.x, target_tile.y)
+                              imp['state'] = 'MOVING_CLAIM'
                           else:
-                            # Priority 3: Reinforcing (Unvisited Dirt Walls)
-                            target_tile = self.map.find_nearest_reinforceable(ix, iy)
-                            if target_tile:
-                                imp['target'] = (target_tile.x, target_tile.y)
-                                imp['state'] = 'MOVING_REINFORCE'
+                                # Priority 3: Reinforcing (Unvisited Dirt Walls) - Lowest?
+                                # This is automatic work.
+                                target_tile = self.map.find_nearest_reinforceable(ix, iy)
+                                if target_tile:
+                                    imp['target'] = (target_tile.x, target_tile.y)
+                                    imp['state'] = 'MOVING_REINFORCE'
             
             # 3. Act based on State
             if imp['state'] == 'RETURNING_GOLD':
@@ -975,12 +1029,24 @@ class EntityManager:
                 dist_x = abs(ix - tx)
                 dist_y = abs(iy - ty)
                 dist = max(dist_x, dist_y)
-                if dist == 1:
+                if dist <= 1:
                     # Start Working
-                    if imp['state'] == 'MOVING_DIG': imp['state'] = 'DIGGING'
-                    elif imp['state'] == 'MOVING_REINFORCE': imp['state'] = 'REINFORCING'
-                    elif imp['state'] == 'MOVING_CLAIM': imp['state'] = 'CLAIMING'
-                    imp['work_timer'] = 0
+                    if imp['state'] == 'MOVING_DIG': 
+                        imp['state'] = 'DIGGING'
+                        imp['work_timer'] = 0
+                    elif imp['state'] == 'MOVING_REINFORCE': 
+                        imp['state'] = 'REINFORCING'
+                        imp['work_timer'] = 0
+                    elif imp['state'] == 'MOVING_CLAIM':
+                         # Claiming requires standing on top (dist == 0)
+                         if dist == 0:
+                             imp['state'] = 'CLAIMING'
+                             imp['work_timer'] = 0
+                         else:
+                             # Keep moving closer if adjacent
+                             path = self.map.get_path_step(ix, iy, tx, ty)
+                             if path: 
+                                 imp['x'], imp['y'] = path
                 else:
                     path = self.map.get_path_step(ix, iy, tx, ty)
                     if path: 
@@ -1331,7 +1397,7 @@ class Renderer:
                 char = 'i'
                 pair = COLOR_IMP
                 
-                if c['type'] == 'GOBAR':
+                if c['type'] == 'GOBARR':
                     char = 'g'
                     pair = COLOR_IMP 
                 elif c['type'] == 'DUMMY':
@@ -1401,7 +1467,7 @@ class Renderer:
             s_text = state_map.get(ent.get('state'), ent.get('state'))
             
             imp_info = f"| {ent.get('name', '???')} (Lvl {ent.get('level',1)}) - {s_text} "
-            if ent['type'] == 'GOBAR':
+            if ent['type'] == 'GOBARR':
                  imp_info += f"| XP:{ent['xp']} HP:{ent['health']}/{ent['max_health']} DMG:{ent['damage']} Wage:{ent['wage']} Hap:{ent.get('happiness', 0)}"
             elif ent['type'] == 'IMP':
                  imp_info += f"| XP:{ent['xp']} HP:{ent['health']}/{ent['max_health']} Hap:{ent.get('happiness', 0)}"
@@ -1738,6 +1804,8 @@ class Game:
                     # Tagging Logic (Soft Rock, Gold, Reinforced)
                     if tile.char in [TILES_SOFT_ROCK, TILES_GOLD, TILES_REINFORCED]:
                         tile.tagged = drag_mode_tag
+                        if drag_mode_tag:
+                            tile.timestamp = time.time()
                         
                     elif tile.char == TILES_FLOOR or tile.char in ['P', 'L', TILES_TREASURY, '=']:
                         # Room assignments should overwrite one another
