@@ -18,6 +18,7 @@ TILES_GOLD = 'o'      # Diggable Gold
 TILES_TREASURY = '$'  # Treasury Floor
 TILES_BED = 'B'       # Lair Bed
 TILES_TRAINING = 'T'  # Training Dummy
+TILES_FARM = 'F'      # Farm Tile
 
 COLOR_ROCK = 1
 COLOR_FLOOR = 2
@@ -36,6 +37,7 @@ COLOR_TRAINING = 13
 COLOR_DUMMY = 14
 COLOR_CLAIMED = 15
 COLOR_TAGGED_REINFORCED = 16
+COLOR_FARM = 17
 
 TILES_TRAINING = 'T'
 # Note: 'O' is used for Dummy in code logic, not a constant yet, but we'll use 'O' string
@@ -224,6 +226,26 @@ class Map:
             # Check if this tile is treasury with space
             tile = self.tiles[curr_y][curr_x]
             if tile.char == TILES_TREASURY and tile.gold_stored < 500:
+                return tile
+            
+            # BFS neighbors (walkable)
+            for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+                nx, ny = curr_x + dx, curr_y + dy
+                if 0 <= nx < self.width and 0 <= ny < self.height:
+                    nt = self.tiles[ny][nx]
+                    if not nt.is_solid and (nx, ny) not in visited:
+                         visited.add((nx, ny))
+                         queue.append((nx, ny))
+        return None
+
+    def find_nearest_farm(self, start_x, start_y):
+        queue = [(start_x, start_y)]
+        visited = set([(start_x, start_y)])
+        while queue:
+            curr_x, curr_y = queue.pop(0)
+            # Check if this tile is Farm
+            tile = self.tiles[curr_y][curr_x]
+            if tile.char == TILES_FARM and not tile.is_solid:
                 return tile
             
             # BFS neighbors (walkable)
@@ -471,6 +493,7 @@ class EntityManager:
             'damage': 0,
             'wage': 0,
             'happiness': 0,
+            'hunger': 0,
             'unconscious': False
         }
         self.ids += 1
@@ -506,9 +529,16 @@ class EntityManager:
         # L1->L2: 10
         # L2->L3: 20
         # L3->L4: 40
+        # Formula: 10 * 2^(level-1). Too fast?
+        # New Formula: Slower. 
+        # L1->L2: 20 (Double start)
+        # L2->L3: 50
+        # L3->L4: 100
         if level < 1: return 0
-        if level == 1: return 10
-        return 10 * (2 ** (level - 1))
+        if level == 1: return 20 
+        # Geometric growth but slower base?
+        # Let's say: 20 * (2.5 ^ (level - 1))? Or just higher base.
+        return int(20 * (2 ** (level - 1)))
 
     def check_level_up(self, c):
         # While XP >= Threshold, Level Up
@@ -591,55 +621,102 @@ class EntityManager:
 
             # STATE TRANSITION LOGIC
             
+            # STATE TRANSITION LOGIC (Weighted Priority)
+            
+            # Regen / Unconscious check
+            if c['state'] == 'UNCONSCIOUS':
+                if c['health'] < c['max_health']:
+                    c['health'] += 0.1 # Slow regen
+                else:
+                    c['state'] = 'IDLE' # Wake up
+                    c['unconscious'] = False
+                continue
+
+            # Calculate Desires
+            desires = []
+            
+            # 1. Survival: Eat
+            if c.get('hunger', 0) > 0 and c['type'] != 'IMP' and c['type'] != 'DUMMY':
+                score = c['hunger']
+                if score > 50: score += 20
+                if score > 80: score += 50
+                desires.append({'action': 'EAT', 'score': score})
+            
+            # 2. Greed: Wage
+            if c.get('wage', 0) > 0:
+                if c['state'] == 'SEEKING_WAGE':
+                    desires.append({'action': 'SEEK_WAGE', 'score': 90})
+            
+            # 3. Duty: Build Bed (Go'barr)
+            if c['type'] == 'GOBARR':
+                pass 
+            
+            # 4. Improvement: Train
+            if c['type'] == 'GOBARR' and c['level'] < 4:
+                score = 40
+                if c.get('happiness', 0) > 5: score += 10
+                desires.append({'action': 'TRAIN', 'score': score})
+            
+            # 5. Work (Imps)
+            if c['type'] == 'IMP':
+                desires.append({'action': 'WORK', 'score': 100})
+            
+            # 6. Idle
+            desires.append({'action': 'IDLE', 'score': 10})
+            
+            desires.sort(key=lambda x: x['score'], reverse=True)
+            best = desires[0]
+            action = best['action']
+            
+            # State Switching
+            if action == 'EAT' and c['state'] != 'EATING' and c['state'] != 'MOVING_EAT':
+                target = self.map.find_nearest_farm(ix, iy)
+                if target:
+                    c['target'] = (target.x, target.y)
+                    c['state'] = 'MOVING_EAT'
+            
+            elif action == 'TRAIN' and c['state'] != 'TRAINING' and c['state'] != 'MOVING_TRAIN':
+                 c['state'] = 'WANT_TRAIN'
+            
+            elif action == 'SEEK_WAGE' and c['state'] != 'SEEKING_WAGE':
+                 c['state'] = 'SEEKING_WAGE'
+            
+            # EXECUTE STATE LOGIC
+            
+            # Hunger Update
+            if c['type'] != 'IMP' and c['type'] != 'DUMMY':
+                c['hunger'] = min(100, c.get('hunger', 0) + 0.5)
+
             # 1. SEEKING_WAGE
             if c['state'] == 'SEEKING_WAGE':
-                 # Find Treasury or Heart with gold?
-                 # Actually just need to reach it to get "paid" (deduct from treasury).
                  if not c['target']:
                       # Find nearest Treasury/Heart with gold > c['wage']
                       # Simplified: Go to Heart preferably or Treasury.
-                      t = self.map.find_nearest_treasury_space(ix, iy) # Usage reuse? This finds unfilled treasury.
-                      # We need ANY treasury.
-                      
-                      # Find any treasury/heart
-                      targets = []
-                      if self.heart_gold >= c['wage']:
-                           targets.append(self.map.heart_pos)
-                      
-                      # Scan treasuries
-                      # Optimize: Nearest BFS search for char '$' or '♥'
-                      # Reuse logic?
-                      # Let's just walk to Heart for now as fallback.
+                      t = self.map.find_nearest_treasury_space(ix, iy)
                       c['target'] = self.map.heart_pos
                  
                  tx, ty = c['target']
-                 # Move
                  dist = max(abs(ix - tx), abs(iy - ty))
                  if dist <= 1:
-                     # Pay
                      paid = False
-                     # Deduct logic simplified for prototype
                      if self.heart_gold >= c['wage']:
                          self.heart_gold -= c['wage']
                          paid = True
-                     # Else check treasury tiles around?
                      
                      if paid:
                          c['state'] = 'IDLE'
                          c['target'] = None
-                         c['happiness'] = min(10, c['happiness'] + 1)
+                         # c['happiness'] = min(10, c['happiness'] + 1)
                      else:
-                         # Failed to pay? Unhappy?
-                         c['state'] = 'IDLE' # Give up for now
-                         c['happiness'] = max(-10, c['happiness'] - 1)
+                         c['state'] = 'IDLE'
+                         # c['happiness'] = max(-10, c['happiness'] - 1)
                  else:
                       path = self.map.get_path_step(ix, iy, tx, ty)
                       if path: c['x'], c['y'] = path
                  continue
             
-            # 2. Go'barr Specific: Bed Construction
+            # 2. Bed Construction
             if c['type'] == 'GOBARR' and c['state'] == 'IDLE':
-                # Check if I own a bed
                 my_bed_pos = None
                 for pos, owner_id in self.bed_ownership.items():
                     if owner_id == c['id']:
@@ -647,30 +724,16 @@ class EntityManager:
                         break
                 
                 if not my_bed_pos:
-                    # Need to build a bed
-                     # Find valid spot
                     if not c.get('building_bed'):
                         target_spot = None
-                        # BFS for Valid Bed Spot
                         q = [(ix, iy)]
                         visited = set([(ix, iy)])
-                        found = False
-                        
-                        # Optimization: Random search or full scan?
-                        # Scanning entire map is expensive.
-                        # Scan 'L' tiles?
-                        
-                        # Simplified: Scan neighborhood first, then global?
-                        # Let's just iterate Lair tiles if we can track them...
-                        # Or just reuse BFS.
-                        
                         while q:
                             cx, cy = q.pop(0)
                             if self.map.is_valid_bed_spot(cx, cy):
                                 target_spot = (cx, cy)
-                                found = True
                                 break
-                            if len(visited) > 800: break # Increased limit
+                            if len(visited) > 800: break
                             for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
                                 nx, ny = cx + dx, cy + dy
                                 if 0 <= nx < self.map.width and 0 <= ny < self.map.height:
@@ -688,9 +751,8 @@ class EntityManager:
                     continue
                 tx, ty = c['target']
                 if (ix, iy) == (tx, ty):
-                    # Construct
                     tile = self.map.get_tile(ix, iy)
-                    if tile.char == 'L' and self.map.is_valid_bed_spot(ix, iy): # Double check validity
+                    if tile.char == 'L' and self.map.is_valid_bed_spot(ix, iy):
                         tile.char = TILES_BED
                         self.bed_ownership[(ix, iy)] = c['id']
                     c['state'] = 'IDLE'
@@ -698,68 +760,69 @@ class EntityManager:
                 else:
                     path = self.map.get_path_step(ix, iy, tx, ty)
                     if path: c['x'], c['y'] = path
-                    else: c['state'] = 'IDLE' # Unreachable
+                    else: c['state'] = 'IDLE'
                 continue
 
-            # 3. Training Logic (Go'barr)
-            if c['type'] == 'GOBARR' and c['level'] < 10:
-                # If IDLE or Wandering
-                # If happiness > 0, more likely to train?
-                
-                 if c['state'] == 'IDLE' and random.random() < 0.1:
-                    # Find Training Dummy
-                    q = [(ix, iy)]
-                    visited = set([(ix, iy)])
-                    target_dummy = None
-                    while q:
-                        cx, cy = q.pop(0)
-                        # Check for dummy creature at this location?
-                        # Dummies are creatures now, not tiles.
-                        # Wait, tiles spawners spawn creatures.
-                        # So we look for a creature of type 'DUMMY'
-                        pass 
-                        
-                        # Inefficient to BFS map for creatures. 
-                        # Better: Iterate dummies list.
-                        if len(visited) > 1: break # Skip BFS
-                    
-                    dummies = [d for d in self.creatures if d['type'] == 'DUMMY']
-                    if dummies:
-                        # Pick nearest
-                        nearest = None
-                        min_dist = 9999
-                        for d in dummies:
-                            dist = abs(c['x'] - d['x']) + abs(c['y'] - d['y'])
-                            if dist < min_dist:
-                                min_dist = dist
-                                nearest = d
-                        
-                        if nearest:
-                            c['target'] = (nearest['x'], nearest['y'])
-                            c['state'] = 'TRAINING'
-            
+            # 3. Training Logic
+            if c['state'] == 'WANT_TRAIN':
+                 dummies = [d for d in self.creatures if d['type'] == 'DUMMY']
+                 if dummies:
+                     dummies.sort(key=lambda d: abs(c['x']-d['x']) + abs(c['y']-d['y']))
+                     target = dummies[0]
+                     c['target'] = (target['x'], target['y'])
+                     c['state'] = 'TRAINING'
+                 else:
+                     c['state'] = 'IDLE'
+
             if c['state'] == 'TRAINING':
-                 if not c['target']:
+                 if not c['target'] or c['level'] >= 4:
                      c['state'] = 'IDLE'
                      continue
+                     
                  tx, ty = c['target']
                  dist = max(abs(ix - tx), abs(iy - ty))
                  
-                 # Are we INSIDE the training room?
-                 # Actually, logic says "enter the Training Room and then move about inside it."
-                 # Simplify: Walk to dummy, attack it.
-                 
                  if dist <= 1:
-                     # Attack Dummy
-                     # Gain XP
-                     c['xp'] += 2
+                     c['xp'] += 1
                      self.check_level_up(c)
-                     # Visual?
+                     
+                     moves = []
+                     for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+                         nx, ny = ix + dx, iy + dy
+                         t = self.map.get_tile(nx, ny)
+                         if t and not t.is_solid and t.char == TILES_TRAINING:
+                             moves.append((nx, ny))
+                     
+                     if moves:
+                         nx, ny = random.choice(moves)
+                         c['x'], c['y'] = nx, ny
                  else:
                      path = self.map.get_path_step(ix, iy, tx, ty)
                      if path: c['x'], c['y'] = path
                      else: c['state'] = 'IDLE'
                  continue
+            
+            # 4. Eating Logic
+            if c['state'] == 'MOVING_EAT':
+                 if not c['target']: 
+                     c['state'] = 'IDLE'
+                     continue
+                 tx, ty = c['target']
+                 if (ix, iy) == (tx, ty):
+                     c['state'] = 'EATING'
+                 else:
+                     path = self.map.get_path_step(ix, iy, tx, ty)
+                     if path: c['x'], c['y'] = path
+                     else: c['state'] = 'IDLE'
+                 continue
+            
+            if c['state'] == 'EATING':
+                 c['hunger'] -= 5
+                 if c['hunger'] <= 0:
+                     c['hunger'] = 0
+                     c['state'] = 'IDLE'
+                 continue
+
 
             # 4. Imp Logic (Worker)
             if c['type'] == 'IMP':
@@ -1278,6 +1341,7 @@ class Renderer:
         curses.init_pair(COLOR_TRAINING, curses.COLOR_BLACK, curses.COLOR_WHITE) 
         curses.init_pair(COLOR_DUMMY, curses.COLOR_YELLOW, curses.COLOR_BLACK)
         curses.init_pair(COLOR_CLAIMED, curses.COLOR_MAGENTA, curses.COLOR_BLACK)
+        curses.init_pair(COLOR_FARM, curses.COLOR_GREEN, curses.COLOR_YELLOW) # Green 'F' on Brown/Yellow background
 
     def draw(self, paused, imps, selected_room, drag_start=None, drag_end=None, total_gold=0, selected_entity=None, mana=0):
         # Removed self.stdscr.clear() to reduce flicker. 
@@ -1351,8 +1415,8 @@ class Renderer:
                        if tile.tagged:
                            pair = COLOR_TAGGED_REINFORCED
                    elif char == TILES_TREASURY: pair = COLOR_TREASURY
-                   elif char == TILES_BED: pair = COLOR_BED
-                   elif char == TILES_TRAINING: pair = COLOR_TRAINING
+
+                   elif char == TILES_FARM: pair = COLOR_FARM
                    elif char == '=': pair = COLOR_GOLD # Explicit fix for white gold
                    
                    attr = curses.color_pair(pair)
@@ -1462,13 +1526,15 @@ class Renderer:
                 'TRAINING': "Training",
                 'MOVING_CLAIM': "Going to claim",
                 'CLAIMING': "Claiming land",
+                'CLAIMING': "Claiming land",
+                'EATING': "Eating",
                 'UNCONSCIOUS': "Unconscious"
             }
             s_text = state_map.get(ent.get('state'), ent.get('state'))
             
             imp_info = f"| {ent.get('name', '???')} (Lvl {ent.get('level',1)}) - {s_text} "
             if ent['type'] == 'GOBARR':
-                 imp_info += f"| XP:{ent['xp']} HP:{ent['health']}/{ent['max_health']} DMG:{ent['damage']} Wage:{ent['wage']} Hap:{ent.get('happiness', 0)}"
+                 imp_info += f"| XP:{ent['xp']} HP:{ent['health']}/{ent['max_health']} DMG:{ent['damage']} Wage:{ent['wage']} Hap:{ent.get('happiness', 0)} Hun:{int(ent.get('hunger',0))}"
             elif ent['type'] == 'IMP':
                  imp_info += f"| XP:{ent['xp']} HP:{ent['health']}/{ent['max_health']} Hap:{ent.get('happiness', 0)}"
         
@@ -1846,6 +1912,8 @@ class Game:
         if self.selected_room == "Treasury": cost_per_tile = 25
         elif self.selected_room == "Lair": cost_per_tile = 50
         elif self.selected_room == "Prison": cost_per_tile = 100
+        elif self.selected_room == "Training Room": cost_per_tile = 150
+        elif self.selected_room == "Farm": cost_per_tile = 100
         
         # Apply Logic to Rect
         for ry in range(min_y, max_y + 1):
@@ -1858,7 +1926,7 @@ class Game:
                         if drag_mode_tag:
                             tile.timestamp = time.time()
                         
-                    elif tile.char == TILES_FLOOR or tile.char in ['P', 'L', TILES_TREASURY, '=']:
+                    elif tile.char == TILES_FLOOR or tile.char in ['P', 'L', TILES_TREASURY, '=', TILES_TRAINING, TILES_FARM]:
                         # Room assignments should overwrite one another
                         char_to_apply = None
                         if self.selected_room == "Corridor":
@@ -1871,10 +1939,11 @@ class Game:
                             char_to_apply = TILES_TREASURY
                         elif self.selected_room == "Training Room":
                             char_to_apply = TILES_TRAINING
+                        elif self.selected_room == "Farm":
+                            char_to_apply = TILES_FARM
                         
                         # Drop logic for costs
                         # Update Costs
-                        if self.selected_room == "Training Room": cost_per_tile = 150 # Expensive?
                         if char_to_apply and cost_per_tile > 0:
                             # Try to pay
                             paid = False
@@ -2018,6 +2087,8 @@ class Game:
                 # Need to update handle_drag_action for "Bed" and "Training Room"
             elif key == ord('6'):
                 self.selected_room = "Training Room"
+            elif key == ord('7'):
+                self.selected_room = "Farm"
             elif key == curses.KEY_UP or key == ord('w'):
                 self.renderer.cam_y -= 1
             elif key == curses.KEY_DOWN or key == ord('s'):
@@ -2045,13 +2116,25 @@ class Game:
                         # We also set selected_entity on press? Or release?
                         # Usually release is safer for "Click vs Drag". 
                         # But simple click:
-                        clicked_imp = None
-                        for imp in self.entities.imps:
-                             if imp['x'] == map_x and imp['y'] == map_y:
-                                 clicked_imp = imp
-                                 break
+                        # Selection Cycling
+                        clicked_entities = []
+                        for c in self.entities.creatures:
+                            if c['x'] == map_x and c['y'] == map_y:
+                                clicked_entities.append(c)
                         
-                        self.selected_entity = clicked_imp
+                        if clicked_entities:
+                            if self.selected_entity in clicked_entities:
+                                # Cycle to next
+                                try:
+                                    idx = clicked_entities.index(self.selected_entity)
+                                    next_idx = (idx + 1) % len(clicked_entities)
+                                    self.selected_entity = clicked_entities[next_idx]
+                                except ValueError:
+                                     self.selected_entity = clicked_entities[0]
+                            else:
+                                self.selected_entity = clicked_entities[0]
+                        else:
+                             self.selected_entity = None
                         # Does not clear on empty click?
                         # If clicked_imp is None, we clear it.
                         # Unless dragging!
