@@ -38,6 +38,7 @@ COLOR_DUMMY = 14
 COLOR_CLAIMED = 15
 COLOR_TAGGED_REINFORCED = 16
 COLOR_FARM = 17
+COLOR_GOBARR = 18
 
 TILES_TRAINING = 'T'
 # Note: 'O' is used for Dummy in code logic, not a constant yet, but we'll use 'O' string
@@ -46,18 +47,17 @@ KEY_QUIT = ord('q')
 
 class Tile:
     def __init__(self, char, x, y):
-
         self.char = char
         self.x = x
         self.y = y
-        self.y = y
         self.tagged = False
         self.claimed = False
-        self.is_solid = char in [TILES_HARD_ROCK, TILES_SOFT_ROCK, TILES_REINFORCED, TILES_GOLD]
+        self.is_solid = char in [TILES_HARD_ROCK, TILES_SOFT_ROCK, TILES_REINFORCED, TILES_GOLD, TILES_TRAINING]
         self.gold_value = 500 if char == TILES_GOLD else 0
         self.gold_stored = 0 # For Treasury
         self.progress = 0 # For digging/reinforcing steps. Max varying.
         self.timestamp = 0 # For job priority
+        self.creator_type = None # Track who built this tile (for beds)
 
 class Map:
     def __init__(self, width, height):
@@ -609,6 +609,27 @@ class EntityManager:
         for c in self.creatures:
             ix, iy = c['x'], c['y']
             
+            # 1. If currently working (Reinforcing or Mining)
+            # Validation of current target
+            target_valid = False
+            if c['target']:
+                 tx, ty = c['target']
+                 t_tile = self.map.get_tile(tx, ty)
+                 # If Digging/Mining: Tagged?
+                 if c['state'] == 'DIGGING':
+                     if t_tile and t_tile.tagged: target_valid = True
+                 # If Reinforcing: Soft Rock?
+                 elif c['state'] == 'REINFORCING':
+                     if t_tile and t_tile.char == TILES_SOFT_ROCK and not t_tile.tagged and t_tile.char != TILES_GOLD: target_valid = True
+                 # If Claiming: Not Claimed?
+                 elif c['state'] == 'CLAIMING':
+                     if t_tile and not t_tile.claimed and not t_tile.is_solid: target_valid = True
+            
+            if not target_valid and c['state'] not in ['RETURNING_GOLD', 'IDLE', 'UNCONSCIOUS', 'MOVING_PICKUP', 'MOVING_DIG', 'MOVING_REINFORCE', 'MOVING_CLAIM', 'SEEKING_WAGE', 'MOVING_EAT', 'EATING', 'CONSTRUCTING_BED', 'TRAINING', 'WANT_TRAIN', 'LEAVING']:
+                c['target'] = None
+                c['state'] = 'IDLE'
+                c['work_timer'] = 0
+            
             # State: UNCONSCIOUS
             if c['health'] <= 0:
                 c['state'] = 'UNCONSCIOUS'
@@ -649,7 +670,13 @@ class EntityManager:
             
             # 3. Duty: Build Bed (Go'barr)
             if c['type'] == 'GOBARR':
-                pass 
+                my_bed_pos = None
+                for pos, owner_id in self.bed_ownership.items():
+                    if owner_id == c['id']:
+                        my_bed_pos = pos
+                        break
+                if not my_bed_pos:
+                    desires.append({'action': 'BUILD_BED', 'score': 80})
             
             # 4. Improvement: Train
             if c['type'] == 'GOBARR' and c['level'] < 4:
@@ -680,6 +707,10 @@ class EntityManager:
             
             elif action == 'SEEK_WAGE' and c['state'] != 'SEEKING_WAGE':
                  c['state'] = 'SEEKING_WAGE'
+
+            elif action == 'BUILD_BED' and c['state'] != 'CONSTRUCTING_BED':
+                # This will be handled by the CONSTRUCTING_BED state logic below
+                pass
             
             # EXECUTE STATE LOGIC
             
@@ -754,6 +785,7 @@ class EntityManager:
                     tile = self.map.get_tile(ix, iy)
                     if tile.char == 'L' and self.map.is_valid_bed_spot(ix, iy):
                         tile.char = TILES_BED
+                        tile.creator_type = c['type']
                         self.bed_ownership[(ix, iy)] = c['id']
                     c['state'] = 'IDLE'
                     c['target'] = None
@@ -783,6 +815,28 @@ class EntityManager:
                  dist = max(abs(ix - tx), abs(iy - ty))
                  
                  if dist <= 1:
+                     # Pay for training (1 gold per tick, roughly 10 per 10)
+                     paid = False
+                     if self.heart_gold >= 1:
+                         self.heart_gold -= 1
+                         paid = True
+                     elif self.total_gold >= 1:
+                         # Attempt to take from Treasury if Heart empty. Find a treasury with money.
+                         for ty in range(self.map.height):
+                             for tx in range(self.map.width):
+                                 tt = self.map.get_tile(tx, ty)
+                                 if tt and tt.char == TILES_TREASURY and tt.gold_stored >= 1:
+                                     tt.gold_stored -= 1
+                                     self.total_gold -= 1
+                                     paid = True
+                                     break
+                             if paid: break
+                     
+                     if not paid:
+                         c['state'] = 'IDLE' # Can't afford
+                         # Optional: happiness decrease
+                         continue
+
                      c['xp'] += 1
                      self.check_level_up(c)
                      
@@ -791,7 +845,14 @@ class EntityManager:
                          nx, ny = ix + dx, iy + dy
                          t = self.map.get_tile(nx, ny)
                          if t and not t.is_solid and t.char == TILES_TRAINING:
-                             moves.append((nx, ny))
+                             # Exclude dummy locations
+                             has_dummy = False
+                             for cre in self.creatures:
+                                 if cre['type'] == 'DUMMY' and cre['x'] == nx and cre['y'] == ny:
+                                     has_dummy = True
+                                     break
+                             if not has_dummy:
+                                 moves.append((nx, ny))
                      
                      if moves:
                          nx, ny = random.choice(moves)
@@ -829,7 +890,7 @@ class EntityManager:
                 pass # Fallthrough to existing worker logic
             else:
                 # Go'barr wander if nothing else
-                if c['state'] == 'IDLE':
+                if c['state'] == 'IDLE' and c['type'] != 'DUMMY':
                      # Random wander
                      c['idle_timer'] += 1
                      if c['idle_timer'] >= 2:
@@ -929,41 +990,49 @@ class EntityManager:
                      
                      
                      
-                     # Check Priority 1: Digging/Reinforcing based on Job Priority
-                     # This unifies Digging and Reinforcing into "Work" if Reinforce was tagged?
-                     # But Reinforce is separate logic in original code (untagged).
-                     # "Priorities: Digging over Claiming"
+                     # Check Priority 1.5: Divide and Conquer - Claiming
+                     # If we have unclaimed tiles, and NO imps are currently moving to claim,
+                     # we should split off one imp to do it.
+                     claim_targets = set()
+                     claiming_imps_count = 0
+                     for other in self.creatures:
+                         if other['target'] and other['state'] in ['MOVING_CLAIM', 'CLAIMING']:
+                             claim_targets.add(other['target'])
+                             claiming_imps_count += 1
+                             
+                     target_tile = None
+                     needs_divider = (claiming_imps_count == 0)
                      
-                     # Digging is Tagged. Reinforcing is untagged auto-work.
-                     # We prioritize Tagged jobs (Digging) first?
-                     # The prompt implies job queue.
+                     if needs_divider:
+                         target_tile = self.map.find_nearest_unclaimed(ix, iy, exclude=claim_targets)
+                         if target_tile:
+                             imp['target'] = (target_tile.x, target_tile.y)
+                             imp['state'] = 'MOVING_CLAIM'
                      
-                     target_tile = self.map.find_priority_job(ix, iy, exclude=exclude_targets)
-                     if target_tile:
-                         imp['target'] = (target_tile.x, target_tile.y)
-                         # Determine state based on tile
-                         # Tagged tiles are usually Digging (or Mining if gold)
-                         # Reset stats
-                         imp['state'] = 'MOVING_DIG' # Logic handles gold/rock in DIGGING state
-                     else:
-                          # Priority 2: Claiming (Unclaimed Floor) - Lower Priority
-                          # Divide and Conquer: Exclude unclaimed tiles already targeted by others for claiming
-                          claim_targets = set()
-                          for other in self.creatures:
-                              if other['target'] and other['state'] in ['MOVING_CLAIM', 'CLAIMING']:
-                                  claim_targets.add(other['target'])
-                          
-                          target_tile = self.map.find_nearest_unclaimed(ix, iy, exclude=claim_targets)
-                          if target_tile:
-                              imp['target'] = (target_tile.x, target_tile.y)
-                              imp['state'] = 'MOVING_CLAIM'
-                          else:
-                                # Priority 3: Reinforcing (Unvisited Dirt Walls) - Lowest?
-                                # This is automatic work.
-                                target_tile = self.map.find_nearest_reinforceable(ix, iy)
-                                if target_tile:
-                                    imp['target'] = (target_tile.x, target_tile.y)
-                                    imp['state'] = 'MOVING_REINFORCE'
+                     if not target_tile:
+                         # Priority 1: Digging/Reinforcing based on Job Priority
+                         target_tile = self.map.find_priority_job(ix, iy, exclude=exclude_targets)
+                         if target_tile:
+                             imp['target'] = (target_tile.x, target_tile.y)
+                             # Determine state based on tile
+                             # Tagged tiles are usually Digging (or Mining if gold)
+                             # Reset stats
+                             imp['state'] = 'MOVING_DIG' # Logic handles gold/rock in DIGGING state
+                         else:
+                              # Priority 2: Claiming (Unclaimed Floor) - Lower Priority
+                              # Divider logic didn't find one, but if we get here there are no dig jobs.
+                              # Just do standard claiming.
+                              target_tile = self.map.find_nearest_unclaimed(ix, iy, exclude=claim_targets)
+                              if target_tile:
+                                  imp['target'] = (target_tile.x, target_tile.y)
+                                  imp['state'] = 'MOVING_CLAIM'
+                              else:
+                                    # Priority 3: Reinforcing (Unvisited Dirt Walls) - Lowest?
+                                    # This is automatic work.
+                                    target_tile = self.map.find_nearest_reinforceable(ix, iy)
+                                    if target_tile:
+                                        imp['target'] = (target_tile.x, target_tile.y)
+                                        imp['state'] = 'MOVING_REINFORCE'
             
             # 3. Act based on State
             if imp['state'] == 'RETURNING_GOLD':
@@ -1301,14 +1370,15 @@ class EntityManager:
                             if not is_center: break
                         
                         if is_center:
-                            has_dummy = False
+                            has_dummy_nearby = False
                             for c in self.creatures:
-                                if c['type'] == 'DUMMY' and c['x'] == x and c['y'] == y:
-                                    has_dummy = True
+                                if c['type'] == 'DUMMY' and abs(c['x'] - x) <= 1 and abs(c['y'] - y) <= 1:
+                                    has_dummy_nearby = True
                                     break
                             
-                            if not has_dummy:
+                            if not has_dummy_nearby:
                                 self.spawn_creature('DUMMY', x, y)
+                                self.map.tiles[y][x].is_solid = True
 
 class Renderer:
     def __init__(self, stdscr, game_map):
@@ -1342,6 +1412,7 @@ class Renderer:
         curses.init_pair(COLOR_DUMMY, curses.COLOR_YELLOW, curses.COLOR_BLACK)
         curses.init_pair(COLOR_CLAIMED, curses.COLOR_MAGENTA, curses.COLOR_BLACK)
         curses.init_pair(COLOR_FARM, curses.COLOR_GREEN, curses.COLOR_YELLOW) # Green 'F' on Brown/Yellow background
+        curses.init_pair(COLOR_GOBARR, curses.COLOR_GREEN, curses.COLOR_BLACK)
 
     def draw(self, paused, imps, selected_room, drag_start=None, drag_end=None, total_gold=0, selected_entity=None, mana=0):
         # Removed self.stdscr.clear() to reduce flicker. 
@@ -1410,6 +1481,11 @@ class Renderer:
                    elif char == TILES_HEART: pair = COLOR_HEART
                    elif char == TILES_PORTAL: pair = COLOR_PORTAL
                    elif char == TILES_GOLD: pair = COLOR_GOLD
+                   elif char == TILES_BED:
+                       if getattr(tile, 'creator_type', None) == 'GOBARR':
+                           pair = COLOR_GOBARR  # Green color just like Gobarrs
+                       else:
+                           pair = COLOR_BED
                    elif char == TILES_REINFORCED:
                        pair = COLOR_REINFORCED
                        if tile.tagged:
@@ -1428,13 +1504,16 @@ class Renderer:
                            attr = curses.color_pair(COLOR_SELECT)
                        else:
                            attr = curses.color_pair(COLOR_SELECT_TEXT) | curses.A_BOLD
-                   
                    # Treasury logic
                    if char == TILES_TREASURY and tile.gold_stored > 0:
                        # Inverted visual for occupied treasury?
                        # "Make the symbol for an occupied space in the treasury an inverted yellow $."
                        attr = curses.color_pair(COLOR_TREASURY) | curses.A_REVERSE
-                   
+                        
+                   # Training Dummy rendering fixes
+                   if char == TILES_TRAINING and tile.is_solid:
+                       attr = curses.color_pair(COLOR_DUMMY) | curses.A_BOLD
+                        
                    # Drag Selection Highlight - Simplified to Start Tile Only
                    if drag_start and (map_x, map_y) == drag_start:
                         if tile.is_solid:
@@ -1463,7 +1542,7 @@ class Renderer:
                 
                 if c['type'] == 'GOBARR':
                     char = 'g'
-                    pair = COLOR_IMP 
+                    pair = COLOR_GOBARR 
                 elif c['type'] == 'DUMMY':
                     char = 'O'
                     pair = COLOR_DUMMY
@@ -1489,22 +1568,7 @@ class Renderer:
         if paused:
             status_text = "PAUSED "
             
-        # Base info
         base_info = f"| Pos: {self.cam_x},{self.cam_y} | Room: {selected_room} | Gold: {total_gold} | Mana: {mana}"
-        # Wait, renderer map doesn't have game ref?
-        # Argument passing? Not ideal.
-        # Let's just fix the argument to pass Mana.
-        # But we are in renderer...
-        pass # Handle in next chunk
-        
-        # Base info
-        base_info = f"| Pos: {self.cam_x},{self.cam_y} | Room: {selected_room} | Gold: {total_gold} | Mana: {mana}"
-        
-        # Payday info?
-        # Accessing renderer via game... need to pass it in?
-        # We can append it if we had access. But draw() arguments.
-        # Let's assume passed in via total_gold or new arg. 
-        # Modifying run() later to pass it? Or just omit for now.
         
         # Priority 2: Inspection (Append at end)
         imp_info = ""
@@ -1526,7 +1590,6 @@ class Renderer:
                 'TRAINING': "Training",
                 'MOVING_CLAIM': "Going to claim",
                 'CLAIMING': "Claiming land",
-                'CLAIMING': "Claiming land",
                 'EATING': "Eating",
                 'UNCONSCIOUS': "Unconscious"
             }
@@ -1538,15 +1601,19 @@ class Renderer:
             elif ent['type'] == 'IMP':
                  imp_info += f"| XP:{ent['xp']} HP:{ent['health']}/{ent['max_health']} Hap:{ent.get('happiness', 0)}"
         
-        final_status = (status_text + base_info + imp_info).strip()
+        final_status_l1 = (status_text + base_info).strip()
+        final_status_l2 = imp_info.strip()
         
-        # Always draw the status line background to clear artifacts
+        # Always draw the status lines background to clear artifacts
         try:
              # Draw Background
+             self.stdscr.addstr(h-2, 0, " " * (w-1))
              self.stdscr.addstr(h-1, 0, " " * (w-1))
              # Draw Text
-             if final_status:
-                self.stdscr.addstr(h-1, 0, final_status[:w-1])
+             if final_status_l1:
+                self.stdscr.addstr(h-2, 0, final_status_l1[:w-1])
+             if final_status_l2:
+                self.stdscr.addstr(h-1, 0, final_status_l2[:w-1])
         except curses.error: pass
         
         # Draw Pause Border
@@ -1665,57 +1732,80 @@ class Menu:
         
         # Clear box area with White Background
         for y in range(box_h):
-            self.stdscr.addstr(start_y + y, start_x, " " * box_w, menu_attr)
+            try:
+                self.stdscr.addstr(start_y + y, start_x, " " * box_w, menu_attr)
+            except curses.error:
+                pass
         
         # Draw explicit box border
         for x in range(box_w):
-             self.stdscr.addch(start_y, start_x + x, '-', menu_attr)
-             self.stdscr.addch(start_y + box_h - 1, start_x + x, '-', menu_attr)
+             try:
+                 self.stdscr.addch(start_y, start_x + x, '-', menu_attr)
+                 self.stdscr.addch(start_y + box_h - 1, start_x + x, '-', menu_attr)
+             except curses.error:
+                 pass
         for y in range(box_h):
-             self.stdscr.addch(start_y + y, start_x, '|', menu_attr)
-             self.stdscr.addch(start_y + y, start_x + box_w - 1, '|', menu_attr)
+             try:
+                 self.stdscr.addch(start_y + y, start_x, '|', menu_attr)
+                 self.stdscr.addch(start_y + y, start_x + box_w - 1, '|', menu_attr)
+             except curses.error:
+                 pass
              
         title = f" MENU: {self.state} "
-        self.stdscr.addstr(start_y, start_x + 2, title, menu_attr)
+        try:
+            self.stdscr.addstr(start_y, start_x + 2, title, menu_attr)
+        except curses.error:
+            pass
 
         if self.state == 'MAIN':
             for i, opt in enumerate(self.options):
                 prefix = "> " if i == self.selected else "  "
                 attr = curses.A_NORMAL if i == self.selected else menu_attr
-                self.stdscr.addstr(start_y + 2 + i * 2, start_x + 4, prefix + opt, attr)
+                try:
+                    self.stdscr.addstr(start_y + 2 + i * 2, start_x + 4, prefix + opt, attr)
+                except curses.error: pass
                 
         elif self.state == 'SAVE':
-            self.stdscr.addstr(start_y + 2, start_x + 2, "Enter Name:", menu_attr)
-            self.stdscr.addstr(start_y + 4, start_x + 2, self.input_text + "_", menu_attr)
-            self.stdscr.addstr(start_y + 10, start_x + 2, "Press Enter to Save", menu_attr)
-            self.stdscr.addstr(start_y + 11, start_x + 2, "Esc to Cancel", menu_attr)
+            try:
+                self.stdscr.addstr(start_y + 2, start_x + 2, "Enter Name:", menu_attr)
+                self.stdscr.addstr(start_y + 4, start_x + 2, self.input_text + "_", menu_attr)
+                self.stdscr.addstr(start_y + 10, start_x + 2, "Press Enter to Save", menu_attr)
+                self.stdscr.addstr(start_y + 11, start_x + 2, "Esc to Cancel", menu_attr)
+            except curses.error: pass
             
         elif self.state == 'LOAD':
             if self.delete_confirm:
-                self.stdscr.addstr(start_y + 2, start_x + 2, "DELETE this save?", menu_attr)
-                self.stdscr.addstr(start_y + 3, start_x + 2, self.delete_confirm, menu_attr)
-                self.stdscr.addstr(start_y + 5, start_x + 2, "> Yes (Enter)", menu_attr)
-                self.stdscr.addstr(start_y + 6, start_x + 2, "  No (Esc)", menu_attr)
+                try:
+                    self.stdscr.addstr(start_y + 2, start_x + 2, "DELETE this save?", menu_attr)
+                    self.stdscr.addstr(start_y + 3, start_x + 2, self.delete_confirm, menu_attr)
+                    self.stdscr.addstr(start_y + 5, start_x + 2, "> Yes (Enter)", menu_attr)
+                    self.stdscr.addstr(start_y + 6, start_x + 2, "  No (Esc)", menu_attr)
+                except curses.error: pass
                 return
 
             if not self.load_files:
-                self.stdscr.addstr(start_y + 2, start_x + 2, "No Saves Found", menu_attr)
+                try: self.stdscr.addstr(start_y + 2, start_x + 2, "No Saves Found", menu_attr)
+                except curses.error: pass
             else:
-                self.stdscr.addstr(start_y + 1, start_x + 25, "(D)elete", menu_attr) 
+                try: self.stdscr.addstr(start_y + 1, start_x + 25, "(D)elete", menu_attr) 
+                except curses.error: pass
                 for i in range(min(5, len(self.load_files))):
                     idx = self.load_index + i 
                     if idx < len(self.load_files):
                          prefix = "> " if idx == self.selected else "  "
                          attr = curses.A_NORMAL if idx == self.selected else menu_attr
-                         self.stdscr.addstr(start_y + 2 + i, start_x + 2, prefix + self.load_files[idx], attr)
+                         try: self.stdscr.addstr(start_y + 2 + i, start_x + 2, prefix + self.load_files[idx], attr)
+                         except curses.error: pass
         
         elif self.state == 'CONFIRM_QUIT':
-             self.stdscr.addstr(start_y + 2, start_x + 2, "Exit ASCIIper?", menu_attr)
+             try: self.stdscr.addstr(start_y + 2, start_x + 2, "Exit ASCIIper?", menu_attr)
+             except curses.error: pass
              opts = ["Yes", "Cancel"]
              for i, opt in enumerate(opts):
                  prefix = "> " if i == self.selected else "  "
                  attr = curses.A_NORMAL if i == self.selected else menu_attr
-                 self.stdscr.addstr(start_y + 5 + i, start_x + 4, prefix + opt, attr)
+                 try: self.stdscr.addstr(start_y + 5 + i, start_x + 4, prefix + opt, attr)
+                 except curses.error: pass
 
     def input(self, key):
         if key == curses.KEY_MOUSE:
@@ -1941,9 +2031,11 @@ class Game:
                             char_to_apply = TILES_TRAINING
                         elif self.selected_room == "Farm":
                             char_to_apply = TILES_FARM
-                        
-                        # Drop logic for costs
-                        # Update Costs
+                        elif self.selected_room == "None":
+                            char_to_apply = None
+                            # It's a priority job
+                            tile.timestamp = 0
+                            cost_per_tile = 0
                         if char_to_apply and cost_per_tile > 0:
                             # Try to pay
                             paid = False
@@ -2082,13 +2174,17 @@ class Game:
                 self.selected_room = "Lair"
             elif key == ord('4'):
                 self.selected_room = "Treasury"
-            elif key == ord('5'):
+            elif key == ord('6'):
                 self.selected_room = "Bed" # Logic maps "Bed" to TILES_BED? No, drag logic maps rooms. 
                 # Need to update handle_drag_action for "Bed" and "Training Room"
-            elif key == ord('6'):
-                self.selected_room = "Training Room"
             elif key == ord('7'):
+                self.selected_room = "Training Room"
+            elif key == ord('8'):
+                self.selected_room = "Priority"
+            elif key == ord('9'):
                 self.selected_room = "Farm"
+            
+            # Map navigation
             elif key == curses.KEY_UP or key == ord('w'):
                 self.renderer.cam_y -= 1
             elif key == curses.KEY_DOWN or key == ord('s'):
