@@ -58,6 +58,7 @@ class Tile:
         self.progress = 0 # For digging/reinforcing steps. Max varying.
         self.timestamp = 0 # For job priority
         self.creator_type = None # Track who built this tile (for beds)
+        self.owner = 0 # 0 = player, 1+ = enemies
 
 class Map:
     def __init__(self, width, height):
@@ -457,16 +458,45 @@ class EntityManager:
         self.creatures = [] # Renamed from imps
         self.ids = 0
         self.total_gold = 0 
-        self.heart_gold = 0
+        self.heart_gold = 0 # Track heart separately
+        self.messages = []
         self.mana = 0
         self.payday_timer = 0
         self.spawn_timer = 0
+        self.next_creature_type = 'IMP'
         self.bed_ownership = {} # (x,y) -> creature_id
         
         # Spawn initial imps
         hx, hy = self.map.heart_pos
         for _ in range(4): # Spawn 4
             self.spawn_creature('IMP', hx, hy)
+
+    def deduct_gold(self, amount):
+        if self.total_gold < amount:
+            return False
+            
+        needed = amount
+        # 1. Deduct from Treasuries first
+        for y in range(self.map.height):
+            for x in range(self.map.width):
+                tile = self.map.get_tile(x, y)
+                if tile and tile.char == TILES_TREASURY and tile.gold_stored > 0:
+                    take = min(needed, tile.gold_stored)
+                    tile.gold_stored -= take
+                    needed -= take
+                    if needed <= 0:
+                        break
+            if needed <= 0:
+                break
+                
+        # 2. Deduct from Heart last
+        if needed > 0:
+            take = min(needed, self.heart_gold)
+            self.heart_gold -= take
+            
+        self.total_gold -= amount
+        return True
+
 
     def spawn_creature(self, c_type, x, y):
         # Added tick_offset to randomize updates or idle timing
@@ -729,12 +759,7 @@ class EntityManager:
                  tx, ty = c['target']
                  dist = max(abs(ix - tx), abs(iy - ty))
                  if dist <= 1:
-                     paid = False
-                     if self.heart_gold >= c['wage']:
-                         self.heart_gold -= c['wage']
-                         paid = True
-                     
-                     if paid:
+                     if self.deduct_gold(c['wage']):
                          c['state'] = 'IDLE'
                          c['target'] = None
                          # c['happiness'] = min(10, c['happiness'] + 1)
@@ -797,6 +822,7 @@ class EntityManager:
 
             # 3. Training Logic
             if c['state'] == 'WANT_TRAIN':
+                 # Target dummy first, otherwise any training tile
                  dummies = [d for d in self.creatures if d['type'] == 'DUMMY']
                  if dummies:
                      dummies.sort(key=lambda d: abs(c['x']-d['x']) + abs(c['y']-d['y']))
@@ -804,7 +830,29 @@ class EntityManager:
                      c['target'] = (target['x'], target['y'])
                      c['state'] = 'TRAINING'
                  else:
-                     c['state'] = 'IDLE'
+                     # Fallback: Find a training room tile
+                     tx, ty = None, None
+                     q = [(ix, iy)]
+                     visited = set([(ix, iy)])
+                     while q:
+                         cx, cy = q.pop(0)
+                         tile = self.map.get_tile(cx, cy)
+                         if tile and tile.char == TILES_TRAINING:
+                             tx, ty = cx, cy
+                             break
+                         if len(visited) > 400: break
+                         for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+                             nx, ny = cx + dx, cy + dy
+                             if 0 <= nx < self.map.width and 0 <= ny < self.map.height:
+                                 if (nx, ny) not in visited and not self.map.tiles[ny][nx].is_solid:
+                                     visited.add((nx, ny))
+                                     q.append((nx, ny))
+                                     
+                     if tx is not None:
+                         c['target'] = (tx, ty)
+                         c['state'] = 'TRAINING'
+                     else:
+                         c['state'] = 'IDLE'
 
             if c['state'] == 'TRAINING':
                  if not c['target'] or c['level'] >= 4:
@@ -813,26 +861,15 @@ class EntityManager:
                      
                  tx, ty = c['target']
                  dist = max(abs(ix - tx), abs(iy - ty))
+                 target_tile = self.map.get_tile(tx, ty)
                  
-                 if dist <= 1:
+                 # Check if target is a dummy or just a training room tile
+                 is_dummy = any(d['type'] == 'DUMMY' and d['x'] == tx and d['y'] == ty for d in self.creatures)
+                 valid_training_spot = dist <= 1 if is_dummy else (dist == 0) # Must stand on tile if no dummy
+                 
+                 if valid_training_spot:
                      # Pay for training (1 gold per tick, roughly 10 per 10)
-                     paid = False
-                     if self.heart_gold >= 1:
-                         self.heart_gold -= 1
-                         paid = True
-                     elif self.total_gold >= 1:
-                         # Attempt to take from Treasury if Heart empty. Find a treasury with money.
-                         for ty in range(self.map.height):
-                             for tx in range(self.map.width):
-                                 tt = self.map.get_tile(tx, ty)
-                                 if tt and tt.char == TILES_TREASURY and tt.gold_stored >= 1:
-                                     tt.gold_stored -= 1
-                                     self.total_gold -= 1
-                                     paid = True
-                                     break
-                             if paid: break
-                     
-                     if not paid:
+                     if not self.deduct_gold(1):
                          c['state'] = 'IDLE' # Can't afford
                          # Optional: happiness decrease
                          continue
@@ -926,11 +963,42 @@ class EntityManager:
                  elif imp['state'] == 'CLAIMING':
                      if t_tile and not t_tile.claimed and not t_tile.is_solid: target_valid = True
             
-            if not target_valid and imp['state'] not in ['RETURNING_GOLD', 'IDLE', 'UNCONSCIOUS', 'MOVING_PICKUP', 'MOVING_DIG', 'MOVING_REINFORCE', 'MOVING_CLAIM']:
+            
+            # STATE STICKINESS LOGIC
+            # If we are in the middle of a continuous work task, don't re-evaluate immediately unless done
+            stay_on_task = False
+            
+            if imp['state'] == 'RETURNING_GOLD' and imp['gold'] > 0:
+                stay_on_task = True
+            elif imp['state'] == 'MOVING_PICKUP':
+                stay_on_task = True
+                # Validate dropped gold is still there
+                if imp['target']:
+                    tx, ty = imp['target']
+                    t = self.map.get_tile(tx, ty)
+                    if not t or t.gold_value <= 0:
+                        stay_on_task = False
+            elif imp['state'] in ['MOVING_CLAIM', 'CLAIMING']:
+                # If we're claiming, try to find another adjacent claim instead of full re-eval
+                stay_on_task = True
+                if not imp['target'] and imp['state'] == 'CLAIMING':
+                     stay_on_task = False # Let it find a new one below
+            elif imp['state'] in ['MOVING_REINFORCE', 'REINFORCING']:
+                stay_on_task = True
+            elif imp['state'] in ['MOVING_DIG', 'DIGGING']:
+                stay_on_task = True
+            
+            if stay_on_task and target_valid:
+                pass # Stick to current state/target handled in Section 3
+            elif imp['state'] not in ['RETURNING_GOLD', 'IDLE', 'UNCONSCIOUS', 'MOVING_PICKUP', 'MOVING_DIG', 'MOVING_REINFORCE', 'MOVING_CLAIM', 'DIGGING', 'REINFORCING', 'CLAIMING']:
                 imp['target'] = None
                 imp['state'] = 'IDLE'
                 imp['work_timer'] = 0
             
+            # Special case for continuous work: if we finish a single tile, we should immediately look for adjacent work of the same type
+            # so we stay "sticky" to the job type without going all the way back to IDLE logic, but if none adjacent, we drop to IDLE.
+            # This is handled mostly in the state execution for CLAIMING, etc.
+
             # 2. Look for work if Idle
             if imp['state'] == 'IDLE':
                 # Check Priorities
@@ -990,24 +1058,66 @@ class EntityManager:
                      
                      
                      
-                     # Check Priority 1.5: Divide and Conquer - Claiming
-                     # If we have unclaimed tiles, and NO imps are currently moving to claim,
-                     # we should split off one imp to do it.
-                     claim_targets = set()
-                     claiming_imps_count = 0
-                     for other in self.creatures:
-                         if other['target'] and other['state'] in ['MOVING_CLAIM', 'CLAIMING']:
-                             claim_targets.add(other['target'])
-                             claiming_imps_count += 1
-                             
-                     target_tile = None
-                     needs_divider = (claiming_imps_count == 0)
+                     # Check Priority 1.5: Divide and Conquer
                      
-                     if needs_divider:
-                         target_tile = self.map.find_nearest_unclaimed(ix, iy, exclude=claim_targets)
+                     # Check what other imps are doing
+                     claim_targets = set()
+                     reinforce_targets = set()
+                     pickup_targets = set()
+                     
+                     claiming_imps_count = 0
+                     reinforcing_imps_count = 0
+                     pickup_imps_count = 0
+                     
+                     for other in self.creatures:
+                         if other['target']:
+                             if other['state'] in ['MOVING_CLAIM', 'CLAIMING']:
+                                 claim_targets.add(other['target'])
+                                 claiming_imps_count += 1
+                             elif other['state'] in ['MOVING_REINFORCE', 'REINFORCING']:
+                                 reinforce_targets.add(other['target'])
+                                 reinforcing_imps_count += 1
+                             elif other['state'] == 'MOVING_PICKUP':
+                                 pickup_targets.add(other['target'])
+                                 pickup_imps_count += 1
+                                 
+                     target_tile = None
+                     
+                     # Need a pickup divider?
+                     if pickup_imps_count == 0 and imp['gold'] < 300:
+                         # Same BFS as above, but with exclude
+                         queue = [(ix, iy)]
+                         visited = set([(ix, iy)])
+                         while queue:
+                             cx, cy = queue.pop(0)
+                             t = self.map.get_tile(cx, cy)
+                             if t.char == TILES_FLOOR and t.gold_value > 0 and not t.is_solid and (cx, cy) not in pickup_targets:
+                                  target_tile = t
+                                  break
+                             if len(visited) > 200: break
+                             for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0), (1, 1), (1, -1), (-1, 1), (-1, -1)]:
+                                 nx, ny = cx + dx, cy + dy
+                                 if 0 <= nx < self.map.width and 0 <= ny < self.map.height:
+                                     if (nx, ny) not in visited:
+                                         visited.add((nx, ny))
+                                         queue.append((nx, ny))
                          if target_tile:
                              imp['target'] = (target_tile.x, target_tile.y)
-                             imp['state'] = 'MOVING_CLAIM'
+                             imp['state'] = 'MOVING_PICKUP'
+                     
+                     # Need a divider for claiming?
+                     if not target_tile and claiming_imps_count == 0:
+                          target_tile = self.map.find_nearest_unclaimed(ix, iy, exclude=claim_targets)
+                          if target_tile:
+                              imp['target'] = (target_tile.x, target_tile.y)
+                              imp['state'] = 'MOVING_CLAIM'
+                     
+                     # Need a divider for reinforcing?
+                     if not target_tile and reinforcing_imps_count == 0:
+                          target_tile = self.map.find_nearest_reinforceable(ix, iy)
+                          if target_tile and (target_tile.x, target_tile.y) not in reinforce_targets:
+                              imp['target'] = (target_tile.x, target_tile.y)
+                              imp['state'] = 'MOVING_REINFORCE'
                      
                      if not target_tile:
                          # Priority 1: Digging/Reinforcing based on Job Priority
@@ -1058,22 +1168,16 @@ class EntityManager:
                      
                      # If both full?
                      if not target_found:
-                         # Drop on floor where we stand
-                         tile = self.map.get_tile(ix, iy)
-                         if tile.char == TILES_FLOOR or tile.char == '=':
-                             tile.gold_value += imp['gold']
-                             tile.char = '=' # Ensure visual
-                             # self.total_gold += imp['gold'] # Dropped gold is NOT secure score.
-                             imp['gold'] = 0
-                             imp['state'] = 'IDLE'
-                             imp['target'] = None
-                             continue
-                         else:
-                             # Should be rare if we are idly moving?
-                             # Just Idle and hope to move to floor?
-                             imp['state'] = 'IDLE' 
-                             imp['target'] = None
-                             continue # Re-eval next tick
+                         # Treasuries and Heart are full. Do not drop gold.
+                         # Wander randomly while holding gold until space opens up.
+                         if random.random() < 0.5:
+                             dx, dy = random.choice([(0, 1), (0, -1), (1, 0), (-1, 0)])
+                             nx, ny = ix + dx, iy + dy
+                             if 0 <= nx < self.map.width and 0 <= ny < self.map.height:
+                                 if not self.map.get_tile(nx, ny).is_solid:
+                                      imp['x'], imp['y'] = nx, ny
+                         imp['target'] = None
+                         continue
  
                 
                 tx, ty = imp['target']
@@ -1140,8 +1244,27 @@ class EntityManager:
                         if t_tile.gold_value <= 0:
                             t_tile.char = TILES_FLOOR # Reset char to floor if depleted
                     
-                    imp['target'] = None
-                    imp['state'] = 'IDLE'
+                    found_next = False
+                    if imp['gold'] < 300:
+                         for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0), (1, 1), (1, -1), (-1, 1), (-1, -1)]:
+                             nx, ny = tx + dx, ty + dy
+                             if 0 <= nx < self.map.width and 0 <= ny < self.map.height:
+                                 nt = self.map.get_tile(nx, ny)
+                                 if nt and nt.char == TILES_FLOOR and nt.gold_value > 0 and not nt.is_solid:
+                                     taken = False
+                                     for other in self.creatures:
+                                         if other['id'] != imp['id'] and other['target'] == (nx, ny):
+                                             taken = True
+                                             break
+                                     if not taken:
+                                         imp['target'] = (nx, ny)
+                                         imp['state'] = 'MOVING_PICKUP'
+                                         found_next = True
+                                         break
+                    
+                    if not found_next:
+                        imp['target'] = None
+                        imp['state'] = 'IDLE'
                 else:
                     path = self.map.get_path_step(ix, iy, tx, ty)
                     if path: 
@@ -1241,11 +1364,11 @@ class EntityManager:
                          imp['state'] = 'RETURNING_GOLD'
                 elif t_tile.char == TILES_REINFORCED:
                     # Reinforced digging takes longer
-                    # Use Progress. Reinforced Wall HP = 200 (approx 2 sec for lvl 1 imp?)
-                    # Each tick adds 10 * lvl progress?
-                    # Previous was 2 ticks.
-                    # Let's say HP = 20.
-                    # Imp adds 10 * level.
+                    # Soft rock HP = 10.
+                    # Player reinforced HP = 30 (3x longer).
+                    # Enemy reinforced HP = 50 (5x longer).
+                    target_hp = 30 if getattr(t_tile, 'owner', 0) == 0 else 50
+                    
                     power = 10 * imp['level']
                     t_tile.progress += power
                     
@@ -1253,13 +1376,32 @@ class EntityManager:
                     imp['xp'] += 1
                     self.check_level_up(imp)
 
-                    if t_tile.progress >= 20:
+                    if t_tile.progress >= target_hp:
                         t_tile.char = TILES_FLOOR
                         t_tile.is_solid = False
                         t_tile.tagged = False
                         t_tile.progress = 0
-                        imp['target'] = None
-                        imp['state'] = 'IDLE'
+                        
+                        # Stickiness: find adjacent tagged tile to dig
+                        found_next = False
+                        for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0), (1, 1), (1, -1), (-1, 1), (-1, -1)]:
+                            nx, ny = tx + dx, ty + dy
+                            nt = self.map.get_tile(nx, ny)
+                            if nt and nt.tagged:
+                                taken = False
+                                for other in self.creatures:
+                                    if other['id'] != imp['id'] and other['target'] == (nx, ny):
+                                        taken = True
+                                        break
+                                if not taken:
+                                    imp['target'] = (nx, ny)
+                                    imp['state'] = 'MOVING_DIG'
+                                    found_next = True
+                                    break
+                                    
+                        if not found_next:
+                            imp['target'] = None
+                            imp['state'] = 'IDLE'
                 else:
                     # Normal Dig (Soft Rock)
                     # HP = 10.
@@ -1274,8 +1416,27 @@ class EntityManager:
                         t_tile.is_solid = False
                         t_tile.tagged = False
                         t_tile.progress = 0
-                        imp['target'] = None
-                        imp['state'] = 'IDLE'
+                        
+                        # Stickiness: find adjacent tagged tile to dig
+                        found_next = False
+                        for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0), (1, 1), (1, -1), (-1, 1), (-1, -1)]:
+                            nx, ny = tx + dx, ty + dy
+                            nt = self.map.get_tile(nx, ny)
+                            if nt and nt.tagged:
+                                taken = False
+                                for other in self.creatures:
+                                    if other['id'] != imp['id'] and other['target'] == (nx, ny):
+                                        taken = True
+                                        break
+                                if not taken:
+                                    imp['target'] = (nx, ny)
+                                    imp['state'] = 'MOVING_DIG'
+                                    found_next = True
+                                    break
+                                    
+                        if not found_next:
+                            imp['target'] = None
+                            imp['state'] = 'IDLE'
 
             elif imp['state'] == 'REINFORCING':
                 tx, ty = imp['target']
@@ -1294,8 +1455,36 @@ class EntityManager:
                     t_tile.char = TILES_REINFORCED
                     t_tile.is_solid = True # Should be solid
                     t_tile.progress = 0
-                    imp['target'] = None
-                    imp['state'] = 'IDLE'
+                    
+                    # Stickiness: find another reinforceable wall nearby
+                    found_next = False
+                    for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+                        nx, ny = tx + dx, ty + dy
+                        nt = self.map.get_tile(nx, ny)
+                        if nt and nt.char == TILES_SOFT_ROCK and not nt.tagged:
+                            # Is it exposed to empty space?
+                            exposed = False
+                            for ex, ey in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+                                et = self.map.get_tile(nx + ex, ny + ey)
+                                if et and not et.is_solid:
+                                    exposed = True
+                                    break
+                            
+                            if exposed:
+                                taken = False
+                                for other in self.creatures:
+                                    if other['id'] != imp['id'] and other['target'] == (nx, ny):
+                                        taken = True
+                                        break
+                                if not taken:
+                                    imp['target'] = (nx, ny)
+                                    imp['state'] = 'MOVING_REINFORCE'
+                                    found_next = True
+                                    break
+                                    
+                    if not found_next:
+                        imp['target'] = None
+                        imp['state'] = 'IDLE'
             
             elif imp['state'] == 'CLAIMING':
                  tx, ty = imp['target']
@@ -1311,8 +1500,30 @@ class EntityManager:
                      t_tile.claimed = True
                      imp['xp'] += 1
                      self.check_level_up(imp) # Grants XP?
-                     imp['state'] = 'IDLE'
-                     imp['target'] = None
+                     
+                     # Stickiness: find another unclaimed tile adjacent to this one
+                     found_next = False
+                     for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0), (1, 1), (1, -1), (-1, 1), (-1, -1)]:
+                         nx, ny = tx + dx, ty + dy
+                         if 0 <= nx < self.map.width and 0 <= ny < self.map.height:
+                             nt = self.map.get_tile(nx, ny)
+                             if nt and not nt.claimed and not nt.is_solid:
+                                 # Ensure no other imp is already claiming this (basic check)
+                                 taken = False
+                                 for other in self.creatures:
+                                     if other['id'] != imp['id'] and other['target'] == (nx, ny):
+                                         taken = True
+                                         break
+                                 if not taken:
+                                     imp['target'] = (nx, ny)
+                                     imp['state'] = 'MOVING_CLAIM'
+                                     imp['work_timer'] = 0
+                                     found_next = True
+                                     break
+                     
+                     if not found_next:
+                         imp['state'] = 'IDLE'
+                         imp['target'] = None
             
             elif imp['state'] == 'IDLE':
                 # Random wander
@@ -2040,68 +2251,9 @@ class Game:
                             # Try to pay
                             paid = False
                             
-                            # 1. Pay from Treasuries
-                            # We iterate ALL tiles to find treasuries with gold? Inefficient?
-                            # Optim: Use self.entities.total_gold check first?
-                            # total_gold includes Heart + Treasury.
-                            
-                            # Simple logic: Check total affordable?
-                            # We need to deduct.
-                            needed = cost_per_tile
-                            
-                            # Search Treasuries
-                            for row in self.map.tiles:
-                                for t in row:
-                                    if t.char == TILES_TREASURY and t.gold_stored > 0:
-                                        take = min(needed, t.gold_stored)
-                                        t.gold_stored -= take
-                                        needed -= take
-                                        if needed <= 0: break
-                                if needed <= 0: break
-                            
-                            # Pay from Heart
-                            if needed > 0:
-                                take = min(needed, self.entities.heart_gold)
-                                self.entities.heart_gold -= take
-                                needed -= take
-                                
-                            if needed <= 0:
-                                paid = True
-                                # Recalc total score optimization? user loop handles it next tick
-                            else:
-                                # Refund logic? Rollback?
-                                # If we failed to pay, we should refund what we took and ABORT.
-                                # Complex partial rollback.
-                                # Easier: Check affordability first.
-                                pass
-                                
-                            # Re-do with pre-check
-                            # Actually, let's just do a quick pre-check of Total Gold.
-                            # self.entities.total_gold is updated each tick. It might be stale?
-                            # Let's count explicitly? No, total_gold should be close enough.
-                            # Recalculate just to be safe.
-                            current_total = self.entities.heart_gold
-                            for row in self.map.tiles:
-                                for t in row:
-                                    if t.char == TILES_TREASURY: current_total += t.gold_stored
-                            
-                            if current_total >= cost_per_tile:
-                                # Deduct Logic (Real)
-                                needed = cost_per_tile
-                                for row in self.map.tiles:
-                                    for t in row:
-                                        if t.char == TILES_TREASURY and t.gold_stored > 0:
-                                            take = min(needed, t.gold_stored)
-                                            t.gold_stored -= take
-                                            needed -= take
-                                            if needed <= 0: break
-                                    if needed <= 0: break
-                                if needed > 0:
-                                    take = min(needed, self.entities.heart_gold)
-                                    self.entities.heart_gold -= take
-                                
-                                # Apply Build
-                                paid = True
+                            # Check affordability first
+                            if self.entities.total_gold >= cost_per_tile:
+                                paid = self.entities.deduct_gold(cost_per_tile)
                             else:
                                 paid = False
                         
