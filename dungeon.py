@@ -1003,10 +1003,18 @@ class EntityManager:
             if imp['state'] == 'IDLE':
                 # Check Priorities
                 
-                # Check 1: Force Return if Full
+                # Check 1: Force Return if Full (but only if there is destination space!)
                 if imp['gold'] >= 300:
-                    imp['state'] = 'RETURNING_GOLD'
-                    continue
+                    hx, hy = self.map.heart_pos
+                    space_exists = False
+                    if self.heart_gold < 5000:
+                        space_exists = True
+                    elif self.map.find_nearest_treasury_space(ix, iy) is not None:
+                        space_exists = True
+                    
+                    if space_exists:
+                        imp['state'] = 'RETURNING_GOLD'
+                        continue
                 
                 # Check 2: REMOVED "Return if carrying gold" to allow picking up dropped gold
                 # We only return if full, or if we explicitly decide to later.
@@ -1168,14 +1176,8 @@ class EntityManager:
                      
                      # If both full?
                      if not target_found:
-                         # Treasuries and Heart are full. Do not drop gold.
-                         # Wander randomly while holding gold until space opens up.
-                         if random.random() < 0.5:
-                             dx, dy = random.choice([(0, 1), (0, -1), (1, 0), (-1, 0)])
-                             nx, ny = ix + dx, iy + dy
-                             if 0 <= nx < self.map.width and 0 <= ny < self.map.height:
-                                 if not self.map.get_tile(nx, ny).is_solid:
-                                      imp['x'], imp['y'] = nx, ny
+                         # Treasuries and Heart are full. Fall back to IDLE.
+                         imp['state'] = 'IDLE'
                          imp['target'] = None
                          continue
  
@@ -1360,8 +1362,7 @@ class EntityManager:
                          # For now, let's just add it to gold_stored, which is unused for gold tiles.
                          t_tile.gold_stored += to_floor
                      
-                     if imp['gold'] >= 300 and t_tile.gold_value <= 0:
-                         imp['state'] = 'RETURNING_GOLD'
+                     # No forced return here, relies on IDLE deciding if space is available
                 elif t_tile.char == TILES_REINFORCED:
                     # Reinforced digging takes longer
                     # Soft rock HP = 10.
@@ -2247,18 +2248,27 @@ class Game:
                             # It's a priority job
                             tile.timestamp = 0
                             cost_per_tile = 0
-                        if char_to_apply and cost_per_tile > 0:
+                        current_cost = cost_per_tile
+                        
+                        # If building a room on an unclaimed tile, it becomes a corridor, and we don't deduct gold
+                        if char_to_apply not in [None, TILES_FLOOR] and not getattr(tile, 'claimed', False):
+                            char_to_apply = TILES_FLOOR
+                            current_cost = 0
+
+                        if char_to_apply and current_cost > 0:
                             # Try to pay
                             paid = False
                             
                             # Check affordability first
-                            if self.entities.total_gold >= cost_per_tile:
-                                paid = self.entities.deduct_gold(cost_per_tile)
+                            if self.entities.total_gold >= current_cost:
+                                paid = self.entities.deduct_gold(current_cost)
                             else:
                                 paid = False
+                        else:
+                            paid = True
                         
                         # Apply if free or paid
-                        if char_to_apply and (cost_per_tile == 0 or paid):
+                        if char_to_apply and (current_cost == 0 or paid):
                              old_char = tile.char 
                              # Handle White Gold Bug / Absorption
                              # If we are overwriting '=' or gold char
