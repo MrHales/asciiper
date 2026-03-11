@@ -19,6 +19,7 @@ TILES_TREASURY = '$'  # Treasury Floor
 TILES_BED = 'B'       # Lair Bed
 TILES_TRAINING = 'T'  # Training Dummy
 TILES_FARM = 'F'      # Farm Tile
+TILES_GEM = '*'       # Indestructible Gem Block
 
 COLOR_ROCK = 1
 COLOR_FLOOR = 2
@@ -39,6 +40,16 @@ COLOR_CLAIMED = 15
 COLOR_TAGGED_REINFORCED = 16
 COLOR_FARM = 17
 COLOR_GOBARR = 18
+COLOR_GEM = 25
+COLOR_TAGGED_GEM = 26
+
+# Splash Screen Colors
+COLOR_SPLASH_RED = 19
+COLOR_SPLASH_YELLOW = 20
+COLOR_SPLASH_WHITE = 21
+COLOR_SPLASH_GREEN = 22
+COLOR_SPLASH_CYAN = 23
+COLOR_SPLASH_BLACK = 24
 
 TILES_TRAINING = 'T'
 # Note: 'O' is used for Dummy in code logic, not a constant yet, but we'll use 'O' string
@@ -52,8 +63,8 @@ class Tile:
         self.y = y
         self.tagged = False
         self.claimed = False
-        self.is_solid = char in [TILES_HARD_ROCK, TILES_SOFT_ROCK, TILES_REINFORCED, TILES_GOLD, TILES_TRAINING]
-        self.gold_value = 500 if char == TILES_GOLD else 0
+        self.is_solid = char in [TILES_HARD_ROCK, TILES_SOFT_ROCK, TILES_REINFORCED, TILES_GOLD, TILES_TRAINING, TILES_GEM]
+        self.gold_value = 500 if char in [TILES_GOLD, TILES_GEM] else 0
         self.gold_stored = 0 # For Treasury
         self.progress = 0 # For digging/reinforcing steps. Max varying.
         self.timestamp = 0 # For job priority
@@ -145,6 +156,54 @@ class Map:
                      # Random walk
                      vx += random.randint(-1, 1)
                      vy += random.randint(-1, 1)
+
+        # 6. Generate Gem Blocks
+        num_gems = random.randint(2, 3)
+        edges = ['top', 'bottom', 'left', 'right']
+        random.shuffle(edges)
+        for i in range(num_gems):
+            edge = edges[i]
+            placed = False
+            
+            for _ in range(50):
+                if edge == 'top':
+                    x = random.randint(2, self.width - 3)
+                    for y in range(1, self.height//2):
+                        if self.tiles[y][x].char == TILES_SOFT_ROCK:
+                            self.tiles[y][x].char = TILES_GEM
+                            self.tiles[y][x].is_solid = True
+                            self.tiles[y][x].gold_value = 500
+                            placed = True
+                            break
+                elif edge == 'bottom':
+                    x = random.randint(2, self.width - 3)
+                    for y in range(self.height - 2, self.height//2, -1):
+                        if self.tiles[y][x].char == TILES_SOFT_ROCK:
+                            self.tiles[y][x].char = TILES_GEM
+                            self.tiles[y][x].is_solid = True
+                            self.tiles[y][x].gold_value = 500
+                            placed = True
+                            break
+                elif edge == 'left':
+                    y = random.randint(2, self.height - 3)
+                    for x in range(1, self.width//2):
+                        if self.tiles[y][x].char == TILES_SOFT_ROCK:
+                            self.tiles[y][x].char = TILES_GEM
+                            self.tiles[y][x].is_solid = True
+                            self.tiles[y][x].gold_value = 500
+                            placed = True
+                            break
+                elif edge == 'right':
+                    y = random.randint(2, self.height - 3)
+                    for x in range(self.width - 2, self.width//2, -1):
+                        if self.tiles[y][x].char == TILES_SOFT_ROCK:
+                            self.tiles[y][x].char = TILES_GEM
+                            self.tiles[y][x].is_solid = True
+                            self.tiles[y][x].gold_value = 500
+                            placed = True
+                            break
+                if placed:
+                    break
 
     def get_tile(self, x, y):
         if 0 <= x < self.width and 0 <= y < self.height:
@@ -257,45 +316,6 @@ class Map:
                     if not nt.is_solid and (nx, ny) not in visited:
                          visited.add((nx, ny))
                          queue.append((nx, ny))
-        return None
-
-    def find_nearest_tagged(self, start_x, start_y, exclude=set()):
-        # BFS to find nearest tagged tile or Gold
-        queue = [(start_x, start_y)]
-        visited = set([(start_x, start_y)])
-        
-        while queue:
-            curr_x, curr_y = queue.pop(0)
-            
-            # Check neighbors (8-way)
-            for dx in [-1, 0, 1]:
-                for dy in [-1, 0, 1]:
-                    if dx == 0 and dy == 0: continue
-                    nx, ny = curr_x + dx, curr_y + dy
-                    if 0 <= nx < self.width and 0 <= ny < self.height:
-                         # ... check logic
-                         pass # handled in loop below
-            
-            # Actual Loop
-            DIRECTIONS = [(0, 1), (0, -1), (1, 0), (-1, 0), (1, 1), (1, -1), (-1, 1), (-1, -1)]
-            for dx, dy in DIRECTIONS:
-                nx, ny = curr_x + dx, curr_y + dy
-                if 0 <= nx < self.width and 0 <= ny < self.height:
-                    tile = self.tiles[ny][nx]
-                    if tile.tagged and tile.is_solid:
-                        if (nx, ny) not in exclude:
-                             # Check if digging reinforced?
-                             return tile
-            
-            # Continue
-            for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
-                nx, ny = curr_x + dx, curr_y + dy
-                if 0 <= nx < self.width and 0 <= ny < self.height:
-                    tile = self.tiles[ny][nx]
-                    if not tile.is_solid and (nx, ny) not in visited:
-                        # Optimization: Prefer path closer to heart?
-                        visited.add((nx, ny))
-                        queue.append((nx, ny))
         return None
     
     def any_tagged_gold(self):
@@ -1316,19 +1336,32 @@ class EntityManager:
                 # Logic:
                 # If Gold: Mine (+100g). If deplete (500g total), turn to floor.
                 # If Rock: Dig (1 tick) -> Floor.
-                
-                # Mining Logic (Unified)
-                if t_tile.char == TILES_GOLD:
-                     mine_amt = 100
-                     available = t_tile.gold_value
-                     
-                     # 1. Mine the rock (reduce availability)
-                     if available > mine_amt:
+                                # Mining Logic (Unified)
+                if t_tile.char in [TILES_GOLD, TILES_GEM]:
+                     if t_tile.char == TILES_GEM:
+                         # 3x longer to mine. Regular yields 100g per 1 tick.
+                         # Require 3 ticks per extraction.
+                         if t_tile.progress < 2:
+                             t_tile.progress += 1
+                             imp['xp'] += 1
+                             self.check_level_up(imp)
+                             continue
+                         t_tile.progress = 0
+                         
+                         mine_amt = 100
                          mined = mine_amt
-                         t_tile.gold_value -= mine_amt
+                         # Gem seams provide infinite gold
                      else:
-                         mined = available
-                         t_tile.gold_value = 0
+                         mine_amt = 100
+                         available = t_tile.gold_value
+                         
+                         # 1. Mine the rock (reduce availability)
+                         if available > mine_amt:
+                             mined = mine_amt
+                             t_tile.gold_value -= mine_amt
+                         else:
+                             mined = available
+                             t_tile.gold_value = 0
                      
                      # 2. Add to Imp if capacity exists
                      space = 300 - imp['gold']
@@ -1339,40 +1372,38 @@ class EntityManager:
                          imp['gold'] += to_inv
                          to_floor -= to_inv
                     
-                     # 3. Handle Dropped Gold
-                     # If tile destroyed, stored on floor. If not, it's effectively "loose" but invisible?
-                     # Per req: "Gold should fall on the ground in the space occupied by the destroyed block"
-                     # We only convert to floor if destroyed (value <= 0).
-                     
-                     if t_tile.gold_value <= 0:
+                     # 3. Handle Dropped Gold & Destroyed block
+                     if t_tile.gold_value <= 0 and t_tile.char != TILES_GEM:
                          t_tile.char = TILES_FLOOR
                          t_tile.is_solid = False
                          t_tile.tagged = False
                          t_tile.gold_value = to_floor + t_tile.gold_stored # Place dropped gold
                          t_tile.gold_stored = 0
                          imp['target'] = None
-                         imp['state'] = 'IDLE' 
+                         # If full, return gold, else go idle
+                         if imp['gold'] >= 300:
+                             imp['state'] = 'RETURNING_GOLD'
+                         else:
+                             imp['state'] = 'IDLE'
                      else:
-                         # Not destroyed yet. 
-                         # If we couldn't carry it, it is currently "lost" or should we store it?
-                         # Per req: "Imps should dig out tagged blocks even if they cannot carry any more gold."
-                         # So we MUST deplete it.
-                         # Where does "to_floor" go?
-                         # We can add a 'dropped_gold' field to Tile distinct from 'gold_value'.
-                         # For now, let's just add it to gold_stored, which is unused for gold tiles.
+                         # Not destroyed yet (or is Gem seam)
                          t_tile.gold_stored += to_floor
-                     
-                     # No forced return here, relies on IDLE deciding if space is available
+                         
+                     # 4. If Imp is full of gold, force it to return
+                     if imp['gold'] >= 300:
+                         imp['target'] = None
+                         imp['state'] = 'RETURNING_GOLD'
+                         
                 elif t_tile.char == TILES_REINFORCED:
                     # Reinforced digging takes longer
                     # Soft rock HP = 10.
                     # Player reinforced HP = 30 (3x longer).
                     # Enemy reinforced HP = 50 (5x longer).
                     target_hp = 30 if getattr(t_tile, 'owner', 0) == 0 else 50
-                    
+                     
                     power = 10 * imp['level']
                     t_tile.progress += power
-                    
+                     
                     # Grant XP
                     imp['xp'] += 1
                     self.check_level_up(imp)
@@ -1382,7 +1413,7 @@ class EntityManager:
                         t_tile.is_solid = False
                         t_tile.tagged = False
                         t_tile.progress = 0
-                        
+                         
                         # Stickiness: find adjacent tagged tile to dig
                         found_next = False
                         for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0), (1, 1), (1, -1), (-1, 1), (-1, -1)]:
@@ -1399,7 +1430,7 @@ class EntityManager:
                                     imp['state'] = 'MOVING_DIG'
                                     found_next = True
                                     break
-                                    
+                                     
                         if not found_next:
                             imp['target'] = None
                             imp['state'] = 'IDLE'
@@ -1408,16 +1439,16 @@ class EntityManager:
                     # HP = 10.
                     power = 10 * imp['level']
                     t_tile.progress += power
-                    
+                     
                     imp['xp'] += 1
                     self.check_level_up(imp)
-                    
+                     
                     if t_tile.progress >= 10:
                         t_tile.char = TILES_FLOOR
                         t_tile.is_solid = False
                         t_tile.tagged = False
                         t_tile.progress = 0
-                        
+                         
                         # Stickiness: find adjacent tagged tile to dig
                         found_next = False
                         for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0), (1, 1), (1, -1), (-1, 1), (-1, -1)]:
@@ -1434,7 +1465,7 @@ class EntityManager:
                                     imp['state'] = 'MOVING_DIG'
                                     found_next = True
                                     break
-                                    
+                                     
                         if not found_next:
                             imp['target'] = None
                             imp['state'] = 'IDLE'
@@ -1615,7 +1646,7 @@ class Renderer:
         curses.init_pair(COLOR_SELECT, curses.COLOR_WHITE, curses.COLOR_BLUE)
         curses.init_pair(COLOR_GOLD, curses.COLOR_YELLOW, curses.COLOR_BLACK)
         curses.init_pair(COLOR_REINFORCED, curses.COLOR_WHITE, curses.COLOR_BLACK)
-        curses.init_pair(COLOR_TAGGED_REINFORCED, curses.COLOR_CYAN, curses.COLOR_BLUE) # Visible
+        curses.init_pair(COLOR_TAGGED_REINFORCED, curses.COLOR_BLUE, curses.COLOR_BLACK) # Visible
         curses.init_pair(COLOR_TREASURY, curses.COLOR_YELLOW, curses.COLOR_BLACK) 
         curses.init_pair(COLOR_MENU, curses.COLOR_BLACK, curses.COLOR_WHITE)
         curses.init_pair(COLOR_SELECT_TEXT, curses.COLOR_YELLOW, curses.COLOR_BLUE)
@@ -1625,6 +1656,16 @@ class Renderer:
         curses.init_pair(COLOR_CLAIMED, curses.COLOR_MAGENTA, curses.COLOR_BLACK)
         curses.init_pair(COLOR_FARM, curses.COLOR_GREEN, curses.COLOR_YELLOW) # Green 'F' on Brown/Yellow background
         curses.init_pair(COLOR_GOBARR, curses.COLOR_GREEN, curses.COLOR_BLACK)
+        curses.init_pair(COLOR_GEM, curses.COLOR_WHITE, curses.COLOR_MAGENTA)
+        curses.init_pair(COLOR_TAGGED_GEM, curses.COLOR_MAGENTA, curses.COLOR_WHITE)
+        
+        # Splash screen colors
+        curses.init_pair(COLOR_SPLASH_RED, curses.COLOR_RED, curses.COLOR_BLACK)
+        curses.init_pair(COLOR_SPLASH_YELLOW, curses.COLOR_YELLOW, curses.COLOR_BLACK)
+        curses.init_pair(COLOR_SPLASH_WHITE, curses.COLOR_WHITE, curses.COLOR_BLACK)
+        curses.init_pair(COLOR_SPLASH_GREEN, curses.COLOR_GREEN, curses.COLOR_BLACK)
+        curses.init_pair(COLOR_SPLASH_CYAN, curses.COLOR_CYAN, curses.COLOR_BLACK)
+        curses.init_pair(COLOR_SPLASH_BLACK, curses.COLOR_BLACK, curses.COLOR_BLACK)
 
     def draw(self, paused, imps, selected_room, drag_start=None, drag_end=None, total_gold=0, selected_entity=None, mana=0):
         # Removed self.stdscr.clear() to reduce flicker. 
@@ -1693,6 +1734,7 @@ class Renderer:
                    elif char == TILES_HEART: pair = COLOR_HEART
                    elif char == TILES_PORTAL: pair = COLOR_PORTAL
                    elif char == TILES_GOLD: pair = COLOR_GOLD
+                   elif char == TILES_GEM: pair = COLOR_GEM
                    elif char == TILES_BED:
                        if getattr(tile, 'creator_type', None) == 'GOBARR':
                            pair = COLOR_GOBARR  # Green color just like Gobarrs
@@ -1712,7 +1754,11 @@ class Renderer:
 
                    if tile.tagged:
                        # Adaptive Highlight for Tagged
-                       if tile.is_solid:
+                       if char == TILES_GEM:
+                           attr = curses.color_pair(COLOR_TAGGED_GEM)
+                       elif char == TILES_REINFORCED:
+                           attr = curses.color_pair(COLOR_TAGGED_REINFORCED)
+                       elif tile.is_solid:
                            attr = curses.color_pair(COLOR_SELECT)
                        else:
                            attr = curses.color_pair(COLOR_SELECT_TEXT) | curses.A_BOLD
@@ -1918,7 +1964,67 @@ class Menu:
         self.load_index = 0
         self.delete_confirm = None # Filename to delete
         
+        self.splash_data = [] # List of (x_offset, y_offset, text, color_pair)
+        self.splash_width = 0
+        self.splash_height = 0
+        self.load_splash()
+        
         self.update_options() # Init options
+
+    def load_splash(self):
+        try:
+            with open('gobarr_splash.html', 'r', encoding='utf-8') as f:
+                html_content = f.read()
+
+            pre_match = re.search(r'<pre>(.*?)</pre>', html_content, re.DOTALL)
+            if not pre_match: return
+            pre_content = pre_match.group(1)
+
+            # Map hex to curses color pair
+            color_map = {
+                'ff0000': COLOR_SPLASH_RED,
+                'ffff00': COLOR_SPLASH_YELLOW,
+                'ffffff': COLOR_SPLASH_WHITE,
+                '00ff00': COLOR_SPLASH_GREEN,
+                '00ffff': COLOR_SPLASH_CYAN,
+                '000000': COLOR_SPLASH_BLACK
+            }
+
+            lines = pre_content.split('\n')
+            self.splash_height = len(lines)
+            max_w = 0
+
+            for y, line in enumerate(lines):
+                # We need to manually match tags, as regex `findall` loses order if we just search for spans.
+                # Since the tags are just `<span style="color:XXXXXX">...</span>` or `<span>...</span>`, 
+                # we can use split or a regex iter.
+                
+                parts = re.split(r'(<span[^>]*>|</span>)', line)
+                current_color = COLOR_SPLASH_WHITE
+                x_offset = 0
+                
+                for part in parts:
+                    if part == '</span>': 
+                        continue
+                    elif part.startswith('<span'):
+                        color_match = re.search(r'color:([0-9a-fA-F]{6})', part)
+                        if color_match:
+                            hex_c = color_match.group(1).lower()
+                            current_color = color_map.get(hex_c, COLOR_SPLASH_WHITE)
+                        else:
+                            current_color = COLOR_SPLASH_WHITE
+                    else:
+                        text = part
+                        # unescape some potential html
+                        text = text.replace('&lt;', '<').replace('&gt;', '>').replace('&amp;', '&').replace('&quot;', '"')
+                        if text:
+                            self.splash_data.append((x_offset, y, text, current_color))
+                            x_offset += len(text)
+                max_w = max(max_w, x_offset)
+            
+            self.splash_width = max_w
+        except Exception as e:
+            pass
 
     def update_options(self):
         if self.game.game_started:
@@ -1933,9 +2039,61 @@ class Menu:
     def draw(self):
         h, w = self.stdscr.getmaxyx()
         
-        # Draw Box
+        if self.state == 'MAIN' and not self.game.game_started and self.splash_data:
+            # We are on the main menu and no game is running, draw the splash screen
+            # Clear everything first
+            for y in range(h):
+                try: self.stdscr.addstr(y, 0, " " * (w - 1))
+                except curses.error: pass
+                
+            start_y = max(0, h // 2 - self.splash_height // 2 - 5)
+            start_x = max(0, w // 2 - self.splash_width // 2)
+            
+            for sx, sy, text, pair in self.splash_data:
+                try:
+                    self.stdscr.addstr(start_y + sy, start_x + sx, text, curses.color_pair(pair))
+                except curses.error:
+                    pass
+            
+            # Title Overlay
+            title_text = [
+                "                                       ",
+                "   _   ___  ___ ___ ___                ",
+                "  /_\\ / __|/ __|_ _|_ _|___ ___ _ _   ",
+                " / _ \\\\__ \\ (__ | | | |/ . \\/ -_) '_|",
+                "/_/ \\_\\___/\\___|___|___|  _/\\___|_|  ",
+                "                       |_|             ",
+                "                                       "
+            ]
+            title_y = start_y + 2
+            title_x = start_x + (self.splash_width // 2) - 20
+            
+            for i, line in enumerate(title_text):
+                try:
+                    # Draw with a striking color, maybe Cyan or White bold
+                    self.stdscr.addstr(title_y + i, title_x, line, curses.color_pair(COLOR_SPLASH_CYAN) | curses.A_BOLD)
+                except curses.error: pass
+                
+            # Horizontal Menu at Bottom
+            menu_y = h - 2
+            total_opts_width = sum(len(opt) for opt in self.options)
+            spacing = (w - total_opts_width) // (len(self.options) + 1)
+            
+            curr_x = spacing
+            for i, opt in enumerate(self.options):
+                attr = curses.A_REVERSE if i == self.selected else curses.color_pair(COLOR_MENU)
+                try:
+                    self.stdscr.addstr(menu_y, curr_x, opt, attr)
+                except curses.error: pass
+                curr_x += len(opt) + spacing
+                
+            return # Skip drawing the box for the main menu splash screen
+                
+        # Draw Menu Box
         box_w = 40
-        box_h = 16 # Increased height for more options
+        box_h = 16
+        
+        # Center menu
         start_y = h // 2 - box_h // 2
         start_x = w // 2 - box_w // 2
         
@@ -1970,6 +2128,7 @@ class Menu:
             pass
 
         if self.state == 'MAIN':
+            # Arrange horizontally if not game_started? Maybe vertically is fine, just resting at bottom.
             for i, opt in enumerate(self.options):
                 prefix = "> " if i == self.selected else "  "
                 attr = curses.A_NORMAL if i == self.selected else menu_attr
@@ -2024,17 +2183,31 @@ class Menu:
             try:
                 _, x, y, _, bstate = curses.getmouse()
                 if bstate & (curses.BUTTON1_CLICKED | curses.BUTTON1_PRESSED):
-                    # Check overlap with Menu Box
                     h, w = self.stdscr.getmaxyx()
-                    box_w = 40
-                    box_h = 16
-                    start_y = h // 2 - box_h // 2
-                    start_x = w // 2 - box_w // 2
                     
-                    # Clicks inside box
-                    if start_x <= x < start_x + box_w and start_y <= y < start_y + box_h:
-                        if self.state == 'MAIN':
-                            rel_y = y - (start_y + 2)
+                    if not self.game.game_started and self.state == 'MAIN':
+                        menu_y = h - 2
+                        if y == menu_y:
+                            total_opts_width = sum(len(opt) for opt in self.options)
+                            spacing = (w - total_opts_width) // (len(self.options) + 1)
+                            curr_x = spacing
+                            for i, opt in enumerate(self.options):
+                                if curr_x <= x < curr_x + len(opt):
+                                    self.selected = i
+                                    key = 10 # Emulate Enter
+                                    break
+                                curr_x += len(opt) + spacing
+                    else:
+                        # Check overlap with Menu Box
+                        box_w = 40
+                        box_h = 16
+                        start_y = h // 2 - box_h // 2
+                        start_x = w // 2 - box_w // 2
+                        
+                        # Clicks inside box
+                        if start_x <= x < start_x + box_w and start_y <= y < start_y + box_h:
+                            if self.state == 'MAIN':
+                                rel_y = y - (start_y + 2)
                             if rel_y >= 0 and rel_y % 2 == 0:
                                 idx = rel_y // 2
                                 if 0 <= idx < len(self.options):
@@ -2171,7 +2344,7 @@ class Game:
         # Standard curses sometimes misses this if TERM is generic
         pass
         
-        self.map = Map(80, 25) # Standard terminal size
+        self.map = Map(113, 35) # Doubled area map
         self.entities = EntityManager(self.map)
         self.renderer = Renderer(stdscr, self.map)
         
@@ -2222,8 +2395,8 @@ class Game:
             for rx in range(min_x, max_x + 1):
                 tile = self.map.get_tile(rx, ry)
                 if tile:
-                    # Tagging Logic (Soft Rock, Gold, Reinforced)
-                    if tile.char in [TILES_SOFT_ROCK, TILES_GOLD, TILES_REINFORCED]:
+                    # Tagging Logic (Soft Rock, Gold, Reinforced, Gem)
+                    if tile.char in [TILES_SOFT_ROCK, TILES_GOLD, TILES_REINFORCED, TILES_GEM]:
                         tile.tagged = drag_mode_tag
                         if drag_mode_tag:
                             tile.timestamp = time.time()
