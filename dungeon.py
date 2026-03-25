@@ -34,7 +34,6 @@ COLOR_MENU = 10
 COLOR_SELECT_TEXT = 11
 COLOR_BED = 12
 COLOR_TRAINING = 13
-COLOR_TRAINING = 13
 COLOR_DUMMY = 14
 COLOR_CLAIMED = 15
 COLOR_TAGGED_REINFORCED = 16
@@ -51,7 +50,6 @@ COLOR_SPLASH_GREEN = 22
 COLOR_SPLASH_CYAN = 23
 COLOR_SPLASH_BLACK = 24
 
-TILES_TRAINING = 'T'
 # Note: 'O' is used for Dummy in code logic, not a constant yet, but we'll use 'O' string
 
 KEY_QUIT = ord('q')
@@ -106,7 +104,6 @@ class Map:
         # Clear area around heart
         for dy in range(-2, 3):
             for dx in range(-2, 3):
-                # if dx == 0 and dy == 0: continue # Heart itself is fine? Heart is at center.
                 nx, ny = cx + dx, cy + dy
                 if 0 <= nx < self.width and 0 <= ny < self.height:
                     # Keep Heart tile
@@ -217,7 +214,7 @@ class Map:
         
         # Limit search depth to avoid lag if unreachable
         steps = 0
-        limit = 500
+        limit = 5000
         
         while queue and steps < limit:
             curr_x, curr_y, path = queue.pop(0)
@@ -431,9 +428,9 @@ class Map:
                     if not tile.is_solid and (nx, ny) not in visited and (nx, ny) not in exclude:
                         visited.add((nx, ny))
                         queue.append((nx, ny))
-                        if len(visited) > 500: break # Perf limit
+                        if len(visited) > 2500: break # Perf limit
             
-            if len(visited) > 500: break
+            if len(visited) > 2500: break
         return None
 
     def count_claimed(self):
@@ -454,28 +451,15 @@ class Map:
     
     def is_valid_bed_spot(self, x, y):
         # Must be Lair ('L')
-        # Must NOT be adjacent to another Bed ('B')
-        # Neighbors 8-way? Or Manhatten?
-        # "at least one empty (Lair) space away from one another"
-        # implies if I am at X, X+1 cannot be bed. X+2 can.
-        # So check immediate neighbors (including diagonals to be safe/neat)
-        
+        # Beds can be placed directly next to each other
         tile = self.get_tile(x, y)
         if not tile or tile.char != 'L': return False
-        
-        for dx in [-1, 0, 1]:
-            for dy in [-1, 0, 1]:
-                if dx == 0 and dy == 0: continue
-                nx, ny = x + dx, y + dy
-                nt = self.get_tile(nx, ny)
-                if nt and nt.char == TILES_BED:
-                    return False
         return True
 
 class EntityManager:
     def __init__(self, game_map):
         self.map = game_map
-        self.creatures = [] # Renamed from imps
+        self.creatures = []
         self.ids = 0
         self.total_gold = 0 
         self.heart_gold = 0 # Track heart separately
@@ -567,11 +551,6 @@ class EntityManager:
             c['name'] = "Dummy"
         
         self.creatures.append(c)
-
-    # Legacy alias property for rendering
-    @property
-    def imps(self):
-        return self.creatures
 
     def get_level_threshold(self, level):
         # Starting level 1. Level 2 takes 10 xp.
@@ -675,7 +654,7 @@ class EntityManager:
                  elif c['state'] == 'CLAIMING':
                      if t_tile and not t_tile.claimed and not t_tile.is_solid: target_valid = True
             
-            if not target_valid and c['state'] not in ['RETURNING_GOLD', 'IDLE', 'UNCONSCIOUS', 'MOVING_PICKUP', 'MOVING_DIG', 'MOVING_REINFORCE', 'MOVING_CLAIM', 'SEEKING_WAGE', 'MOVING_EAT', 'EATING', 'CONSTRUCTING_BED', 'TRAINING', 'WANT_TRAIN', 'LEAVING']:
+            if not target_valid and c['state'] not in ['RETURNING_GOLD', 'IDLE', 'UNCONSCIOUS', 'MOVING_PICKUP', 'MOVING_DIG', 'MOVING_REINFORCE', 'MOVING_CLAIM', 'SEEKING_WAGE', 'MOVING_EAT', 'EATING', 'CONSTRUCTING_BED', 'TRAINING', 'WANT_TRAIN', 'LEAVING', 'PATROLLING']:
                 c['target'] = None
                 c['state'] = 'IDLE'
                 c['work_timer'] = 0
@@ -684,7 +663,7 @@ class EntityManager:
             if c['health'] <= 0:
                 c['state'] = 'UNCONSCIOUS'
                 c['unconscious'] = True
-                # No actions. Imps drag them?
+                # No actions. Other creatures drag them?
                 continue
             
             # Regen?
@@ -734,11 +713,15 @@ class EntityManager:
                 if c.get('happiness', 0) > 5: score += 10
                 desires.append({'action': 'TRAIN', 'score': score})
             
-            # 5. Work (Imps)
+            # 5. Work (Creatures)
             if c['type'] == 'IMP':
                 desires.append({'action': 'WORK', 'score': 100})
             
-            # 6. Idle
+            # 6. Patrol
+            if c['type'] == 'GOBARR':
+                desires.append({'action': 'PATROL', 'score': 15})
+            
+            # 7. Idle
             desires.append({'action': 'IDLE', 'score': 10})
             
             desires.sort(key=lambda x: x['score'], reverse=True)
@@ -762,6 +745,9 @@ class EntityManager:
                 # This will be handled by the CONSTRUCTING_BED state logic below
                 pass
             
+            elif action == 'PATROL' and c['state'] != 'PATROLLING':
+                 c['state'] = 'PATROLLING'
+            
             # EXECUTE STATE LOGIC
             
             # Hunger Update
@@ -782,10 +768,8 @@ class EntityManager:
                      if self.deduct_gold(c['wage']):
                          c['state'] = 'IDLE'
                          c['target'] = None
-                         # c['happiness'] = min(10, c['happiness'] + 1)
                      else:
                          c['state'] = 'IDLE'
-                         # c['happiness'] = max(-10, c['happiness'] - 1)
                  else:
                       path = self.map.get_path_step(ix, iy, tx, ty)
                       if path: c['x'], c['y'] = path
@@ -809,7 +793,7 @@ class EntityManager:
                             if self.map.is_valid_bed_spot(cx, cy):
                                 target_spot = (cx, cy)
                                 break
-                            if len(visited) > 800: break
+                            if len(visited) > 2500: break
                             for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
                                 nx, ny = cx + dx, cy + dy
                                 if 0 <= nx < self.map.width and 0 <= ny < self.map.height:
@@ -860,7 +844,7 @@ class EntityManager:
                          if tile and tile.char == TILES_TRAINING:
                              tx, ty = cx, cy
                              break
-                         if len(visited) > 400: break
+                         if len(visited) > 2500: break
                          for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
                              nx, ny = cx + dx, cy + dy
                              if 0 <= nx < self.map.width and 0 <= ny < self.map.height:
@@ -946,23 +930,25 @@ class EntityManager:
             if c['type'] == 'IMP':
                 pass # Fallthrough to existing worker logic
             else:
-                # Go'barr wander if nothing else
-                if c['state'] == 'IDLE' and c['type'] != 'DUMMY':
-                     # Random wander
-                     c['idle_timer'] += 1
-                     if c['idle_timer'] >= 2:
-                        c['idle_timer'] = 0
-                        neighbors = []
-                        for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
-                            nx, ny = ix + dx, iy + dy
-                            t = self.map.get_tile(nx, ny)
-                            if t and not t.is_solid:
-                                neighbors.append((nx, ny))
-                        if neighbors:
-                            nx, ny = random.choice(neighbors)
-                            c['x'] = nx
-                            c['y'] = ny
-                continue
+                if c['state'] == 'PATROLLING':
+                    if not c['target'] or (ix, iy) == c['target']:
+                        rx = random.randint(1, self.map.width - 2)
+                        ry = random.randint(1, self.map.height - 2)
+                        t = self.map.get_tile(rx, ry)
+                        if t and not t.is_solid:
+                            c['target'] = (rx, ry)
+                        else:
+                            c['state'] = 'IDLE' 
+                        continue
+                        
+                    tx, ty = c['target']
+                    path = self.map.get_path_step(ix, iy, tx, ty)
+                    if path: 
+                        c['x'], c['y'] = path
+                    else: 
+                        c['state'] = 'IDLE'
+                        c['target'] = None
+                continue  # Catch-all to prevent Go'barrs from running Imp logic
 
             # --- ORIGINAL IMP LOGIC STARTS HERE (Refactored variable 'imp' to 'c') ---
             imp = c # Alias for minimal code change
@@ -1667,7 +1653,7 @@ class Renderer:
         curses.init_pair(COLOR_SPLASH_CYAN, curses.COLOR_CYAN, curses.COLOR_BLACK)
         curses.init_pair(COLOR_SPLASH_BLACK, curses.COLOR_BLACK, curses.COLOR_BLACK)
 
-    def draw(self, paused, imps, selected_room, drag_start=None, drag_end=None, total_gold=0, selected_entity=None, mana=0):
+    def draw(self, paused, creatures, selected_room, drag_start=None, drag_end=None, total_gold=0, selected_entity=None, mana=0):
         # Removed self.stdscr.clear() to reduce flicker. 
         # We overwrite the entire viewport anyway.
         h, w = self.stdscr.getmaxyx()
@@ -1751,6 +1737,8 @@ class Renderer:
                    
                    attr = curses.color_pair(pair)
                    if char == '=': attr |= curses.A_BOLD # Bright Yellow for dropped gold
+                   if char == TILES_BED and getattr(tile, 'creator_type', None) == 'GOBARR':
+                       attr |= curses.A_BOLD # Match Go'barr bright green exactly
 
                    if tile.tagged:
                        # Adaptive Highlight for Tagged
@@ -1790,7 +1778,7 @@ class Renderer:
                        pass
         
         # Draw Creatures
-        for c in imps: # Generic alias 'imps' passed from run loop is actually creatures list
+        for c in creatures:
             scr_x = c['x'] - self.cam_x
             scr_y = c['y'] - self.cam_y
             if 0 <= scr_x < w and 0 <= scr_y < h - 1:
@@ -1836,6 +1824,7 @@ class Renderer:
             # Map state to descriptive text
             state_map = {
                 'IDLE': "Idle",
+                'PATROLLING': "Patrolling",
                 'MOVING_DIG': "Going to dig",
                 'DIGGING': "Digging",
                 'RETURNING_GOLD': "Carrying gold",
@@ -2179,6 +2168,10 @@ class Menu:
                  except curses.error: pass
 
     def input(self, key):
+        if key == ord(' ') and self.game.game_started and self.state == 'MAIN':
+            self.active = False
+            self.game.paused = False
+            return
         if key == curses.KEY_MOUSE:
             try:
                 _, x, y, _, bstate = curses.getmouse()
@@ -2302,6 +2295,8 @@ class Menu:
             elif key == 10:
                 filename = self.load_files[self.selected]
                 if SaveManager.load_game(self.game, filename):
+                    self.game.game_started = True
+                    self.game.paused = False
                     self.active = False
                     self.state = 'MAIN'
             elif key == ord('d') or key == ord('D'):
@@ -2626,16 +2621,13 @@ class Game:
             d_end = self.drag_end if not self.menu.active else None
             
             # Pass Payday? 
-            # We didn't change draw signature for Payday timer yet.. 
-            # Just relying on status update?
-            # Revisit: We updated draw to handle 'imps' argument as generic 'creatures'.
             # The following line seems to be a copy-paste error from another context,
             # but it's part of the instruction, so it's included.
             self.renderer.cam_y = self.renderer.cam_y # This line is effectively a no-op.
             
             # Render
             # Pass Mana
-            self.renderer.draw(self.paused, self.entities.imps, self.selected_room, self.drag_start, self.drag_end, self.entities.total_gold, self.selected_entity, self.entities.mana)
+            self.renderer.draw(self.paused, self.entities.creatures, self.selected_room, self.drag_start, self.drag_end, self.entities.total_gold, self.selected_entity, self.entities.mana)
             
             if self.menu.active:
                 self.menu.draw()
