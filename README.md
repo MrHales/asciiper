@@ -1,4 +1,3 @@
-ASCIIper
 ASCIIper is an experimental, ASCII-based dungeon management game inspired by the classic Dungeon Keeper. It was created primarily to explore the frontiers of "vibe coding" using Google Antigravity and Gemini.
 
 🦇 About the Project
