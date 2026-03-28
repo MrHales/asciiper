@@ -1,6 +1,5 @@
 ASCIIper is an experimental, ASCII-based dungeon management game inspired by the classic Dungeon Keeper. It was created primarily to explore the frontiers of "vibe coding" using Google Antigravity and Gemini.
 
-🦇 About the Project
 This project serves as a hands-on exploration of agent-first development. Instead of writing every line of code manually from scratch, ASCIIper was built by directing autonomous AI agents within the Google Antigravity IDE. The goal was to test how effectively an AI-driven workflow can handle the logic, rendering, and entity management of a fully playable text-based simulation.
 
 ⛏️ Features
