@@ -1,3 +1,5 @@
+[![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2FMrHales%2Fasciiper.svg?type=shield)](https://app.fossa.com/projects/git%2Bgithub.com%2FMrHales%2Fasciiper?ref=badge_shield)
+
 ASCIIper is an experimental, ASCII-based dungeon management game inspired by the classic Dungeon Keeper. It was created primarily to explore the frontiers of "vibe coding" using Google Antigravity and Gemini.
 
 This project serves as a hands-on exploration of agent-first development. Instead of writing every line of code manually from scratch, ASCIIper was built by directing autonomous AI agents within the Google Antigravity IDE. The goal was to test how effectively an AI-driven workflow can handle the logic, rendering, and entity management of a fully playable text-based simulation.
@@ -22,3 +24,7 @@ Vibe Coding Methodology: The development process focused on high-level prompting
 ASCIIper is proudly Free Software, strictly adhering to the definition maintained by the Free Software Foundation. You are free to run, copy, distribute, study, change, and improve the software.
 
 Author: Mr. Hales
+
+
+## License
+[![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2FMrHales%2Fasciiper.svg?type=large)](https://app.fossa.com/projects/git%2Bgithub.com%2FMrHales%2Fasciiper?ref=badge_large)
